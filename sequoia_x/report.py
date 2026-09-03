@@ -235,6 +235,23 @@ class ReportBuilder:
             lines.append("⭐ 多策略共振：")
             for c in result["cross_hits"]:
                 lines.append(f"  {c['code']} {c['name']} 市值{c['cap_yi']:.0f}亿（{' + '.join(c['strategies'])}）")
+        # 回测参考（若有）
+        if result.get("backtest"):
+            bt = result["backtest"]
+            lines.append("")
+            lines.append(f"📊 回测参考（{bt['range']}，信号日次日买入→N日卖出，不含手续费）")
+            for name, hs in bt["strategies"].items():
+                if not any(v.get("count") for v in hs.values()):
+                    continue
+                cells = []
+                for h in (5, 10, 20):
+                    s = hs.get(str(h)) or hs.get(h)
+                    if s and s.get("count"):
+                        cells.append(f"{h}日胜率{s['win_rate']}%")
+                    else:
+                        cells.append(f"{h}日—")
+                lines.append(f"  {name}: {' | '.join(cells)}")
+            lines.append("  ⚠️ 历史胜率≠未来收益，仅供策略参考")
         return "\n".join(lines).rstrip() + "\n"
 
 
@@ -242,12 +259,28 @@ def run_report(
     json_out: str | None = None,
     markdown: bool = False,
     cap_range: tuple[float, float] = (50.0, 800.0),
+    backtest_json: str | None = "data/backtest_1y.json",
 ) -> dict:
-    """执行报告构建并按要求输出。返回结构化结果 dict。"""
+    """执行报告构建并按要求输出。返回结构化结果 dict。
+
+    backtest_json: 回测缓存 JSON 路径（None 则不含回测区块）。
+    回测较慢（~30s），建议 cron 单独更新缓存，日报直接加载。
+    """
     settings = get_settings()
     engine = DataEngine(settings)
     builder = ReportBuilder(engine, min_cap_yi=cap_range[0], max_cap_yi=cap_range[1])
     result = builder.build()
+
+    if backtest_json:
+        path = Path(backtest_json)
+        if path.exists():
+            try:
+                result["backtest"] = json.loads(path.read_text(encoding="utf-8"))
+                logger.info(f"回测参考已加载: {path}")
+            except Exception as exc:
+                logger.warning(f"回测 JSON 解析失败: {exc}")
+        else:
+            logger.warning(f"回测缓存不存在（跳过）: {path}")
 
     if json_out:
         path = Path(json_out)
