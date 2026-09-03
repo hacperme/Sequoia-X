@@ -146,9 +146,13 @@ class DataEngine:
         df = df[df["volume"] > 0]
 
         count = len(df)
+        # 精确删除本批 (symbol, date) 的旧行后重插，避免整日期删除误伤
+        # 并发/断点续跑中其他进程已同步的当日行（2026-09-03 曾因此丢数据）。
+        keys = df[["symbol", "date"]].drop_duplicates().values.tolist()
         with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
+            conn.executemany(
+                "DELETE FROM stock_daily WHERE symbol = ? AND date = ?", keys
+            )
             df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
             conn.commit()
 
