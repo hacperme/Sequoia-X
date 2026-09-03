@@ -39,10 +39,10 @@ class RpsBreakoutStrategy(BaseStrategy):
         latest_df['rps'] = latest_df['pct_change'].rank(pct=True) * 100
         strong_stocks = latest_df[latest_df['rps'] >= self.rps_threshold].copy()
 
-        # 计算滚动最高价
-        roll_high = df.groupby('symbol')['high'].rolling(
-            window=self.rps_period, min_periods=self.rps_period // 2
-        ).max().reset_index(level=0, drop=True)
+        # 计算滚动最高价（shift(1) 不含当日，防未来函数；与回测引擎口径一致）
+        roll_high = df.groupby('symbol')['high'].transform(
+            lambda s: s.shift(1).rolling(window=self.rps_period).max()
+        )
         df['roll_high'] = roll_high
 
         latest_roll_high = df[df['date'] == latest_date][['symbol', 'roll_high']]

@@ -30,6 +30,27 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+# 退市股历史表：消除回测幸存者偏差（2024 后退市的股票入此表，不入主表，
+# 避免日报策略把退市股当现役选入）。schema 与主表一致，回测 UNION 读取。
+_CREATE_TABLE_DELISTED_SQL = """
+CREATE TABLE IF NOT EXISTS stock_daily_delisted (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol   TEXT    NOT NULL,
+    date     TEXT    NOT NULL,
+    open     REAL,
+    high     REAL,
+    low      REAL,
+    close    REAL,
+    volume   REAL,
+    turnover REAL,
+    UNIQUE (symbol, date)
+);
+"""
+
+_CREATE_INDEX_DELISTED_SQL = """
+CREATE INDEX IF NOT EXISTS idx_delisted_symbol_date ON stock_daily_delisted (symbol, date);
+"""
+
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
@@ -66,6 +87,8 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_TABLE_DELISTED_SQL)
+            conn.execute(_CREATE_INDEX_DELISTED_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -301,6 +324,131 @@ class DataEngine:
         logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
 
     # ── 股票列表 ──
+
+    def get_delisted_symbols(self, since: str = "2023-12-31") -> list[tuple[str, str, str]]:
+        """获取退市/非上市股票（type=1 & status!=1），返回 [(symbol, bs_code, out_date)]。
+
+        用于回测幸存者偏差修复：退市股单独回填到 stock_daily_delisted 表。
+        since：只返回该日期之后退市的（回测区间 2024-01 起，更早退市的无数据）。
+        """
+        import baostock as bs
+
+        lg = bs.login()
+        if lg.error_code != "0":
+            logger.error(f"baostock 登录失败: {lg.error_msg}")
+            return []
+        try:
+            rs = bs.query_stock_basic(code_name="", code="")
+            out = []
+            while rs.next():
+                row = rs.get_row_data()
+                # [code, code_name, ipoDate, outDate, type, status]
+                code, out_date, typ, status = row[0], row[3], row[4], row[5]
+                if typ == "1" and status != "1" and out_date and out_date >= since:
+                    symbol = code.split(".")[1]
+                    if not symbol.startswith(("6", "9")) and not symbol.startswith(("0", "3")):
+                        continue  # 只收沪深 A 股（baostock 无北交所，4/8/920 跳过）
+                    out.append((symbol, code, out_date))
+            logger.info(f"获取退市股列表完成（{since} 后退市）：{len(out)} 只")
+            return out
+        except Exception as e:
+            logger.error(f"获取退市股列表失败: {e}")
+            return []
+        finally:
+            bs.logout()
+
+    def backfill_delisted(self, since: str = "2023-12-31") -> int:
+        """回填退市股历史日 K 到 stock_daily_delisted（单线程 + 重试，数据量小）。
+
+        每只拉 [max(本地已有, start_date), out_date] 后复权日线。
+        """
+        import time
+        from datetime import date, timedelta
+
+        import baostock as bs
+
+        stocks = self.get_delisted_symbols(since)
+        if not stocks:
+            return 0
+
+        lg = bs.login()
+        if lg.error_code != "0":
+            logger.error(f"baostock 登录失败: {lg.error_msg}")
+            return 0
+
+        total_rows = 0
+        failed = 0
+        try:
+            for i, (symbol, bs_code, out_date) in enumerate(stocks):
+                with sqlite3.connect(self.db_path) as conn:
+                    row = conn.execute(
+                        "SELECT MAX(date) FROM stock_daily_delisted WHERE symbol = ?",
+                        (symbol,),
+                    ).fetchone()
+                last = row[0] if row and row[0] else None
+                end = min(out_date, date.today().isoformat())
+                if last and last >= end:
+                    continue
+                start = self.start_date
+                if last:
+                    start = (date.fromisoformat(last) + timedelta(days=1)).isoformat()
+
+                rows: list[list[str]] = []
+                for attempt in range(3):
+                    try:
+                        rs = bs.query_history_k_data_plus(
+                            bs_code,
+                            "date,open,high,low,close,volume,amount",
+                            start_date=start,
+                            end_date=end,
+                            frequency="d",
+                            adjustflag="1",  # 后复权
+                        )
+                        if rs.error_code != "0":
+                            raise RuntimeError(rs.error_msg)
+                        while rs.next():
+                            rows.append(rs.get_row_data())
+                        break
+                    except Exception as exc:
+                        if attempt < 2:
+                            time.sleep(2 ** (attempt + 1))
+                            bs.logout()
+                            time.sleep(1)
+                            bs.login()
+                        else:
+                            logger.warning(f"[{symbol}] 退市股拉取 3 次失败：{exc}")
+                            failed += 1
+                if not rows:
+                    continue
+
+                df = pd.DataFrame(
+                    rows,
+                    columns=["date", "open", "high", "low", "close", "volume", "turnover"],
+                )
+                for col in ["open", "high", "low", "close", "volume", "turnover"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna(subset=["close"])
+                df = df[df["volume"] > 0]
+                if df.empty:
+                    continue
+                df.insert(0, "symbol", symbol)
+                keys = df[["symbol", "date"]].drop_duplicates().values.tolist()
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.executemany(
+                        "DELETE FROM stock_daily_delisted WHERE symbol = ? AND date = ?", keys
+                    )
+                    df.to_sql(
+                        "stock_daily_delisted", conn, if_exists="append",
+                        index=False, method="multi", chunksize=500,
+                    )
+                    conn.commit()
+                total_rows += len(df)
+                if (i + 1) % 20 == 0:
+                    logger.info(f"退市股回填 {i + 1}/{len(stocks)}，累计 {total_rows} 行")
+        finally:
+            bs.logout()
+        logger.info(f"退市股回填完成：{total_rows} 行，失败 {failed} 只")
+        return total_rows
 
     def get_all_symbols(self) -> list[str]:
         """通过 baostock 获取全市场 A 股代码列表。"""

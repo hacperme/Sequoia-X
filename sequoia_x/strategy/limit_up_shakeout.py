@@ -3,6 +3,7 @@
 import pandas as pd
 
 from sequoia_x.core.logger import get_logger
+from sequoia_x.market_rules import is_limit_up
 from sequoia_x.strategy.base import BaseStrategy
 
 logger = get_logger(__name__)
@@ -45,8 +46,8 @@ class LimitUpShakeoutStrategy(BaseStrategy):
                 prev1 = df.iloc[-2]  # 昨日
                 today = df.iloc[-1]  # 今日
 
-                # 条件 1：昨日涨停
-                limit_up_yesterday = prev1["close"] >= prev2["close"] * 1.095
+                # 条件 1：昨日涨停（按板块幅度判定：主板10%/双创20%/北交所30%）
+                limit_up_yesterday = is_limit_up(prev2["close"], prev1["close"], symbol)
                 # 条件 2：今日收阴
                 bearish_today = today["close"] < today["open"]
                 # 条件 3：今日放量

@@ -1,26 +1,26 @@
-"""事件研究法回测引擎（向量化，不改策略代码）。
+"""事件研究法回测引擎 v2（向量化，不改策略代码）。
 
-思路：把全市场日线载入内存（329 万行级），对每只股票用 pandas 向量化
-计算"哪些交易日满足策略信号条件"（事件表），再直接关联该股未来 N 个
-交易日的真实收益，聚合胜率 / 均值 / 中位数 / 与沪深300基准对比。
+v2 相对 v1 的修复（2026-09-04，详见 .hermes/plans/2026-09-04-sequoia-review-fix.md）：
+1. 分板涨跌停：涨停洗盘/上升跌停按板块幅度（主板10%/双创20%）判定，替代死值 1.095/0.905
+2. 海龟成交额直接用库内真实成交额列（turnover 列存 baostock amount），删 volume×close 估算
+3. 幸存者偏差：panel = 现役表 UNION 退市表（stock_daily_delisted，2024 后退市 101 只）
+4. 成本模型：--cost-bps 双边基点，默认 25；胜率/收益输出 net 口径 + gross_* 原始
+5. Wilson 95% 置信区间
+6. MAE/止损统计：信号后 10 日内最大不利偏移 + 触发 -5%/-8% 比例
+7. 简化组合层：按信号日等权 → 净值曲线 → 年化/最大回撤/相对沪深300 超额
 
-相对"逐日切片重跑策略 run()"的优势：
-- 无需为每个历史交易日重建引擎/重跑全市场（那要 250×6×5200 次调用）
-- 一次 panel 载入 + groupby 向量化 = 秒级到分钟级
+口径：信号日收盘判定 → 次日收盘买入 → 未来 N 交易日收盘卖出；
+胜率 = 净收益 > 0 占比；净收益 = 毛收益 - cost_bps/10000。
 
 用法：
-    python -m sequoia_x.backtest --json-out data/backtest.json
-    python -m sequoia_x.backtest --period 1y --top 20
-
-口径说明：
-- 信号日 = 满足条件的那根 K 线（收盘后判定，不偷看未来：rolling 均 shift(1)）
-- 收益 = 信号日次日收盘买入 → 未来第 N 个交易日收盘卖出（不含手续费/滑点）
-- 胜率 = 收益 > 0 的占比
+    python -m sequoia_x.backtest --json-out data/backtest_1y.json
+    python -m sequoia_x.backtest --period 1y --cost-bps 25 --grid
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from pathlib import Path
@@ -35,28 +35,43 @@ load_dotenv()
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
+from sequoia_x.market_rules import limit_up_ratio, limit_down_ratio
 
 logger = get_logger(__name__)
 
 HORIZONS = (5, 10, 20)
+MAE_H = 10          # 止损统计窗口（交易日）
+STOP_LEVELS = (0.05, 0.08)
+DEFAULT_COST_BPS = 25  # 双边合计成本基点（佣金+印花税+滑点）
 
 
 def _load_panel(db_path: str) -> pd.DataFrame:
+    """全市场日线面板（现役 UNION 退市），含真实成交额（turnover 列）与分板涨跌停倍率。"""
     with sqlite3.connect(db_path) as conn:
-        df = pd.read_sql(
-            "SELECT symbol, date, open, high, low, close, volume, turnover FROM stock_daily",
-            conn,
-        )
+        q = """
+        SELECT symbol, date, open, high, low, close, volume, turnover FROM stock_daily
+        UNION ALL
+        SELECT symbol, date, open, high, low, close, volume, turnover FROM stock_daily_delisted
+        """
+        df = pd.read_sql(q, conn)
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
-    # 每股时间序号（用于未来收益对齐）
     df["seq"] = df.groupby("symbol").cumcount()
+    # 分板涨跌停倍率（逐行，向量化判定用）
+    df["lim_up"] = df["symbol"].map(limit_up_ratio)
+    df["lim_dn"] = df["symbol"].map(limit_down_ratio)
     return df
 
 
-# ── 全表向量化信号：预计算各策略所需特征（groupby.transform 一次完成）──
+# ── 全表向量化信号（groupby.transform 一次完成）──
 
-def compute_events(panel: pd.DataFrame, strategies: list[str] | None = None) -> dict[str, pd.DataFrame]:
+def compute_events(
+    panel: pd.DataFrame,
+    strategies: list[str] | None = None,
+    turtle_window: int = 20,
+    rps_period: int = 120,
+    rps_threshold: int = 90,
+) -> dict[str, pd.DataFrame]:
     """对每个策略算出信号事件表 {strategy: DataFrame[symbol, date, seq]}。全表向量化。"""
     g = panel.groupby("symbol", sort=False)
     close = panel["close"]
@@ -64,17 +79,15 @@ def compute_events(panel: pd.DataFrame, strategies: list[str] | None = None) -> 
     high = panel["high"]
     low = panel["low"]
     volume = panel["volume"]
-    # 预计算所有需要的特征（每列一次 transform）
+    amount = panel["turnover"]  # 真实成交额（baostock amount 字段，入库时列名 turnover）
     feats = {
         "close": close,
         "open": open_,
-        "high": high,
         "volume": volume,
         "ma5": g["close"].transform(lambda s: s.rolling(5).mean()),
         "ma20": g["close"].transform(lambda s: s.rolling(20).mean()),
         "vol_ma20": g["volume"].transform(lambda s: s.rolling(20).mean()),
         "ma60": g["close"].transform(lambda s: s.rolling(60).mean()),
-        "high20_prev": g["high"].transform(lambda s: s.shift(1).rolling(20).max()),
         "close_prev": g["close"].transform(lambda s: s.shift(1)),
         "close_prev2": g["close"].transform(lambda s: s.shift(2)),
         "vol_prev": g["volume"].transform(lambda s: s.shift(1)),
@@ -82,14 +95,16 @@ def compute_events(panel: pd.DataFrame, strategies: list[str] | None = None) -> 
         "lo40": g["low"].transform(lambda s: s.rolling(40).min()),
         "hi10": g["high"].transform(lambda s: s.rolling(10).max()),
         "lo10": g["low"].transform(lambda s: s.rolling(10).min()),
-        "ma20_prev": None, "ma60_prev": None,
     }
+    # 海龟窗口可参数化（网格）
+    feats["hiW_prev"] = g["high"].transform(
+        lambda s: s.shift(1).rolling(turtle_window).max()
+    )
     feats["ma20_prev"] = feats["ma20"].shift(1)
     feats["ma60_prev"] = feats["ma60"].shift(1)
 
     def mask_to_events(mask: pd.Series) -> pd.DataFrame:
-        hit = panel.loc[mask, ["symbol", "date", "seq"]]
-        return hit.reset_index(drop=True)
+        return panel.loc[mask, ["symbol", "date", "seq"]].reset_index(drop=True)
 
     def dedupe(ev: pd.DataFrame, cooldown: int = 20) -> pd.DataFrame:
         """同股冷却：同一股票 cooldown 个交易日内只保留首个信号，避免重叠窗口。"""
@@ -109,11 +124,11 @@ def compute_events(panel: pd.DataFrame, strategies: list[str] | None = None) -> 
 
     events: dict[str, pd.DataFrame] = {}
     if not strategies or "海龟突破" in strategies:
-        amount = volume * close
-        m = (close > feats["high20_prev"]) & (amount > 100_000_000) \
+        # 真实成交额过亿（非 volume×后复权价估算）
+        m = (close > feats["hiW_prev"]) & (amount > 100_000_000) \
             & (close > open_) & (close > feats["close_prev"])
         events["海龟突破"] = dedupe(mask_to_events(m.fillna(False)))
-        logger.info(f"海龟突破: {len(events['海龟突破'])} 信号")
+        logger.info(f"海龟突破(W={turtle_window}): {len(events['海龟突破'])} 信号")
     if not strategies or "均线放量" in strategies:
         golden = (feats["ma5"].shift(1) <= feats["ma20"].shift(1)) & (feats["ma5"] > feats["ma20"])
         surge = volume > feats["vol_ma20"] * 1.5
@@ -125,97 +140,243 @@ def compute_events(panel: pd.DataFrame, strategies: list[str] | None = None) -> 
         events["高窄旗形"] = dedupe(mask_to_events(m.fillna(False)))
         logger.info(f"高窄旗形: {len(events['高窄旗形'])} 信号")
     if not strategies or "涨停洗盘" in strategies:
-        m = (feats["close_prev"] >= feats["close_prev2"] * 1.095) \
-            & (close < open_) & (volume > feats["vol_prev"] * 2.0)
+        # 昨涨停（分板幅度）× 今收阴 × 放量 2 倍 × 支撑不破
+        m = (feats["close_prev"] >= feats["close_prev2"] * panel["lim_up"]) \
+            & (close < open_) & (volume > feats["vol_prev"] * 2.0) \
+            & (low >= feats["close_prev"])
         events["涨停洗盘"] = dedupe(mask_to_events(m.fillna(False)))
         logger.info(f"涨停洗盘: {len(events['涨停洗盘'])} 信号")
     if not strategies or "上升跌停" in strategies:
-        m = (feats["ma20_prev"] > feats["ma60_prev"]) & (close <= feats["close_prev"] * 0.905) \
+        # 上升趋势（昨 MA20>MA60）× 跌停（分板幅度）× 放量 2 倍
+        m = (feats["ma20_prev"] > feats["ma60_prev"]) \
+            & (close <= feats["close_prev"] * panel["lim_dn"]) \
             & (volume > feats["vol_ma20"] * 2.0)
         events["上升跌停"] = dedupe(mask_to_events(m.fillna(False)))
         logger.info(f"上升跌停: {len(events['上升跌停'])} 信号")
     if not strategies or "RPS 突破" in strategies:
-        chg120 = g["close"].transform(lambda s: s.pct_change(120))
-        high120 = g["high"].transform(lambda s: s.shift(1).rolling(120).max())
-        tmp = panel[["date"]].copy()
-        tmp["symbol"] = panel["symbol"]
-        tmp["chg120"] = chg120.values
-        tmp["high120"] = high120.values
+        chg = g["close"].transform(lambda s: s.pct_change(rps_period))
+        high_prev = g["high"].transform(lambda s: s.shift(1).rolling(rps_period).max())
+        tmp = panel[["symbol", "date"]].copy()
+        tmp["chg"] = chg.values
+        tmp["high_prev"] = high_prev.values
         tmp["close"] = close.values
-        tmp = tmp.dropna(subset=["chg120", "high120"])
-        tmp["rps"] = tmp.groupby("date")["chg120"].rank(pct=True) * 100
-        m = (tmp["rps"] >= 90) & (tmp["close"] >= tmp["high120"] * 0.9)
-        hit = tmp.loc[m, ["symbol", "date"]]
-        hit = hit.merge(panel[["symbol", "date", "seq"]], on=["symbol", "date"], how="left")
+        tmp = tmp.dropna(subset=["chg", "high_prev"])
+        tmp["rps"] = tmp.groupby("date")["chg"].rank(pct=True) * 100
+        m = (tmp["rps"] >= rps_threshold) & (tmp["close"] >= tmp["high_prev"] * 0.9)
+        hit = tmp.loc[m, ["symbol", "date"]].merge(
+            panel[["symbol", "date", "seq"]], on=["symbol", "date"], how="left"
+        )
         events["RPS 突破"] = dedupe(hit.reset_index(drop=True))
-        logger.info(f"RPS 突破: {len(events['RPS 突破'])} 信号")
+        logger.info(f"RPS 突破(T={rps_threshold}): {len(events['RPS 突破'])} 信号")
     return events
 
 
-def _future_ret(panel: pd.DataFrame, events: pd.DataFrame, h: int) -> list[float]:
-    """对每个信号事件，计算未来 h 个交易日收益（次日收盘买 → 第h日收盘卖）。"""
+def _future_close(panel: pd.DataFrame, events: pd.DataFrame, h: int) -> pd.Series:
+    """每个事件在 seq+h 日的收盘价。返回按事件行序的 Series（h=1 即入场价）。"""
     if events.empty:
-        return []
+        return pd.Series(dtype=float)
     ev = events[["symbol", "seq"]].reset_index()
     ev.columns = ["eid", "symbol", "seq_in"]
-    entry_df = ev.copy()
-    exit_df = ev.copy()
-    entry_df["seq_entry"] = entry_df["seq_in"] + 1
-    exit_df["seq_exit"] = exit_df["seq_in"] + h
-    # 用 eid 做对齐键，merge 后按 eid 排序还原事件顺序
-    e_close = entry_df[["eid", "symbol", "seq_entry"]].rename(columns={"seq_entry": "seq"}).merge(
-        panel[["symbol", "seq", "close"]], on=["symbol", "seq"], how="left")
-    x_close = exit_df[["eid", "symbol", "seq_exit"]].rename(columns={"seq_exit": "seq"}).merge(
-        panel[["symbol", "seq", "close"]], on=["symbol", "seq"], how="left")
-    e_close = e_close.sort_values("eid")["close"]
-    x_close = x_close.sort_values("eid")["close"]
-    m = pd.concat([e_close.reset_index(drop=True), x_close.reset_index(drop=True)], axis=1)
-    m.columns = ["entry", "exit"]
-    m = m.dropna()
-    if m.empty:
+    ev["seq_t"] = ev["seq_in"] + h
+    m = ev[["eid", "symbol", "seq_t"]].rename(columns={"seq_t": "seq"}).merge(
+        panel[["symbol", "seq", "close"]], on=["symbol", "seq"], how="left"
+    )
+    m = m.sort_values("eid")
+    return m["close"].reset_index(drop=True)
+
+
+def _future_ret(panel: pd.DataFrame, events: pd.DataFrame, h: int) -> list[float]:
+    """每事件毛收益：次日收盘买入 → 第 h 日收盘卖出。"""
+    if events.empty:
         return []
-    rets = (m["exit"] / m["entry"] - 1).replace([np.inf, -np.inf], np.nan).dropna().tolist()
+    entry = _future_close(panel, events, 1)
+    exit_ = _future_close(panel, events, h)
+    rets = (exit_ / entry - 1).replace([np.inf, -np.inf], np.nan).dropna()
     return [r for r in rets if np.isfinite(r)]
 
 
-def run_backtest(period: str = "1y", json_out: str | None = None) -> dict:
+def _wilson_ci(win: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score 95% 置信区间（小样本也稳）。返回百分数。"""
+    if n == 0:
+        return (0.0, 0.0)
+    p = win / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return (round(max(centre - half, 0.0) * 100, 1), round(min(centre + half, 1.0) * 100, 1))
+
+
+def _mae_stats(panel: pd.DataFrame, events: pd.DataFrame, h: int = MAE_H,
+               levels: tuple[float, ...] = STOP_LEVELS) -> dict | None:
+    """最大不利偏移：信号后 h 日内最低收盘相对入场价的跌幅分布 + 止损触发率。"""
+    if events.empty:
+        return None
+    ev = events[["symbol", "seq"]].reset_index()
+    ev.columns = ["eid", "symbol", "seq_in"]
+    # 展开每事件到 seq_in+1 .. seq_in+h
+    rows = ev.loc[ev.index.repeat(h)].copy()
+    rows["k"] = rows.groupby(level=0).cumcount() + 1
+    rows = rows.reset_index(drop=True)
+    rows["seq"] = rows["seq_in"] + rows["k"]
+    rows = rows.merge(panel[["symbol", "seq", "close"]], on=["symbol", "seq"], how="left")
+    rows = rows.dropna(subset=["close"])
+    ent = ev[["eid", "symbol", "seq_in"]].merge(
+        panel[["symbol", "seq", "close"]],
+        left_on=["symbol", "seq_in"], right_on=["symbol", "seq"], how="left"
+    )[["eid", "close"]].rename(columns={"close": "entry"})
+    merged = rows.merge(ent, on="eid")
+    merged = merged.dropna(subset=["entry"])
+    if merged.empty or merged["entry"].eq(0).any():
+        return None
+    merged["mae"] = merged["close"] / merged["entry"] - 1  # 负数=浮亏
+    worst = merged.groupby("eid")["mae"].min()
+    n = len(worst)
+    out = {"h": h, "n": int(n)}
+    qs = worst.quantile([0.05, 0.25, 0.5, 0.75, 0.95]).round(4)
+    for q, v in qs.items():
+        out[f"mae_q{int(q*100):02d}"] = float(v)
+    for lv in levels:
+        out[f"stop{int(lv*100)}"] = round(float((worst <= -lv).mean()) * 100, 1)
+    return out
+
+
+def _portfolio(panel: pd.DataFrame, events: pd.DataFrame, h: int,
+               cost_bps: int, index_df: pd.DataFrame | None) -> dict | None:
+    """简化组合层：按信号日等权聚合 h 日净收益 → 净值曲线 → 年化/最大回撤/超额。
+
+    诚实口径：'信号日等权滚动指数'——每个有信号的交易日等权持有一组
+    未来 h 日收益的均值，非真实重叠持仓模拟。
+    """
+    if events.empty or len(events) < 10:
+        return None
+    entry = _future_close(panel, events, 1)
+    exit_ = _future_close(panel, events, h)
+    rets = (exit_ / entry - 1).replace([np.inf, -np.inf], np.nan)
+    tmp = events[["date"]].copy()
+    tmp["ret"] = rets.values - cost_bps / 10000
+    tmp = tmp.dropna(subset=["ret"])
+    if tmp.empty:
+        return None
+    daily = tmp.groupby("date")["ret"].mean().sort_index()
+    if len(daily) < 10:
+        return None
+    nav = (1 + daily).cumprod()
+    total = float(nav.iloc[-1] / nav.iloc[0] - 1)
+    n_days = len(daily)
+    span_years = max((daily.index[-1] - daily.index[0]).days / 365.25, 1 / 252)
+    ann = float((1 + total) ** (1 / span_years) - 1) if total > -1 else -1.0
+    peak = nav.cummax()
+    dd = (nav / peak - 1).min()
+    out = {
+        "h": h, "n_days": int(n_days), "n_events": int(len(tmp)),
+        "total_ret": round(total * 100, 1),
+        "ann_ret": round(ann * 100, 1),
+        "max_drawdown": round(float(dd) * 100, 1),
+        "span_years": round(span_years, 2),
+    }
+    if index_df is not None and not index_df.empty:
+        # 同期沪深300 区间收益（首信号日 → 末信号日，用指数日线）
+        s, e = daily.index[0], daily.index[-1]
+        seg = index_df[(index_df["date"] >= s) & (index_df["date"] <= e)]
+        if len(seg) > 5:
+            idx_ret = float(seg["close"].iloc[-1] / seg["close"].iloc[0] - 1)
+            out["idx_ret"] = round(idx_ret * 100, 1)
+            out["excess"] = round((total - idx_ret) * 100, 1)
+    return out
+
+
+def _fetch_index(index_code: str = "sh.000300", days_back: int = 800) -> pd.DataFrame | None:
+    """现拉沪深300 日线（后复权 close），供组合层超额对比；失败返回 None 不阻塞。"""
+    try:
+        import baostock as bs
+        from datetime import date, timedelta
+        bs.login()
+        try:
+            start = (date.today() - timedelta(days=days_back)).isoformat()
+            rs = bs.query_history_k_data_plus(
+                index_code, "date,close", start_date=start,
+                end_date=date.today().isoformat(), frequency="d", adjustflag="3",
+            )
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            if not rows:
+                return None
+            df = pd.DataFrame(rows, columns=["date", "close"])
+            df["date"] = pd.to_datetime(df["date"])
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            return df.dropna(subset=["close"])
+        finally:
+            bs.logout()
+    except Exception as exc:
+        logger.warning(f"沪深300 拉取失败（跳过超额对比）：{exc}")
+        return None
+
+
+def _stats(rets: list[float], cost_bps: int) -> dict:
+    if not rets:
+        return {"count": 0}
+    arr = np.array(rets)
+    net = arr - cost_bps / 10000
+    n = len(net)
+    ci = _wilson_ci(int((net > 0).sum()), n)
+    return {
+        "count": int(n),
+        "win_rate": round(float((net > 0).mean()) * 100, 1),       # net 口径胜率
+        "mean_ret": round(float(net.mean()) * 100, 2),             # net 口径均值
+        "median_ret": round(float(np.median(net)) * 100, 2),       # net 口径中位数
+        "gross_win_rate": round(float((arr > 0).mean()) * 100, 1),
+        "gross_mean_ret": round(float(arr.mean()) * 100, 2),
+        "ci_low": ci[0], "ci_high": ci[1],
+    }
+
+
+def run_backtest(
+    period: str = "1y",
+    json_out: str | None = None,
+    cost_bps: int = DEFAULT_COST_BPS,
+    turtle_window: int = 20,
+    rps_threshold: int = 90,
+    with_portfolio: bool = True,
+    fetch_index: bool = True,
+) -> dict:
     settings = get_settings()
     engine = DataEngine(settings)
     panel = _load_panel(engine.db_path)
 
-    # 期间过滤
     if period.endswith("y"):
         years = int(period[:-1])
         cutoff = panel["date"].max() - pd.DateOffset(years=years)
         panel = panel[panel["date"] > cutoff].reset_index(drop=True)
-    # 重算 seq（过滤后）
     panel["seq"] = panel.groupby("symbol").cumcount()
 
-    events = compute_events(panel)
+    events = compute_events(panel, turtle_window=turtle_window, rps_threshold=rps_threshold)
+    index_df = _fetch_index() if (with_portfolio and fetch_index) else None
+
     result: dict[str, dict] = {}
     for name, ev in events.items():
         result[name] = {}
         for h in HORIZONS:
             rets = _future_ret(panel, ev, h)
-            if not rets:
-                result[name][h] = {"count": 0, "win_rate": None,
-                                   "mean_ret": None, "median_ret": None}
-                continue
-            arr = np.array(rets)
-            result[name][h] = {
-                "count": int(len(arr)),
-                "win_rate": round(float((arr > 0).mean()) * 100, 1),
-                "mean_ret": round(float(arr.mean()) * 100, 2),
-                "median_ret": round(float(np.median(arr)) * 100, 2),
-            }
+            result[name][h] = _stats(rets, cost_bps)
+        # MAE/止损统计（固定 10 日窗口）
+        result[name]["mae"] = _mae_stats(panel, ev)
+        # 简化组合层（10 日持有）
+        if with_portfolio:
+            result[name]["portfolio"] = _portfolio(panel, ev, 10, cost_bps, index_df)
         logger.info(f"{name} 回测完成")
 
     out = {
-        "method": "event-study-vectorized",
-        "note": "信号日收盘判定 → 次日收盘买入 → 未来N交易日收盘卖出；不含手续费/滑点；后复权价",
+        "method": "event-study-vectorized-v2",
+        "note": (
+            f"信号日收盘判定 → 次日收盘买入 → 未来N交易日收盘卖出；"
+            f"胜率/收益为 net 口径（已扣双边成本 {cost_bps}bp）；"
+            f"含 2024 后退市股（消除幸存者偏差）；分板涨跌停；后复权价"
+        ),
         "range": f"{panel['date'].min().date()} ~ {panel['date'].max().date()}",
         "n_stocks": int(panel["symbol"].nunique()),
         "n_rows": int(len(panel)),
+        "cost_bps": cost_bps,
         "strategies": result,
     }
     if json_out:
@@ -224,22 +385,98 @@ def run_backtest(period: str = "1y", json_out: str | None = None) -> dict:
     return out
 
 
+def _run_grid(json_out: str | None = None, cost_bps: int = DEFAULT_COST_BPS) -> dict:
+    """参数网格：海龟通道 {20,40,55}（经典海龟双通道）+ RPS 阈值 {80,90,95}。"""
+    settings = get_settings()
+    engine = DataEngine(settings)
+    panel = _load_panel(engine.db_path)
+    years = 1
+    cutoff = panel["date"].max() - pd.DateOffset(years=years)
+    panel = panel[panel["date"] > cutoff].reset_index(drop=True)
+    panel["seq"] = panel.groupby("symbol").cumcount()
+
+    grid: dict[str, dict] = {"海龟突破": {}, "RPS 突破": {}}
+    for w in (20, 40, 55):
+        ev = compute_events(panel, strategies=["海龟突破"], turtle_window=w)[
+            "海龟突破"]
+        grid["海龟突破"][str(w)] = {
+            "n": int(len(ev)),
+            "h": {str(h): {k: _stats(_future_ret(panel, ev, h), cost_bps)[k]
+                           for k in ("count", "win_rate", "mean_ret")} for h in HORIZONS},
+        }
+    for t in (80, 90, 95):
+        ev = compute_events(panel, strategies=["RPS 突破"], rps_threshold=t)[
+            "RPS 突破"]
+        grid["RPS 突破"][str(t)] = {
+            "n": int(len(ev)),
+            "h": {str(h): {k: _stats(_future_ret(panel, ev, h), cost_bps)[k]
+                           for k in ("count", "win_rate", "mean_ret")} for h in HORIZONS},
+        }
+
+    # 打印对比表
+    print(f"参数网格（近 1 年，net 口径含 {cost_bps}bp 成本）\n")
+    for strat, params in grid.items():
+        print(f"【{strat}】")
+        for p, v in params.items():
+            row = f"  参数 {p:>4}: n={v['n']:>6}"
+            for h in (5, 10, 20):
+                s = v["h"][str(h)]
+                wr = s["win_rate"] if s["count"] else float("nan")
+                row += f" | {h}日胜率 {wr}%"
+            print(row)
+        print()
+    out = {"method": "param-grid", "range": f"{panel['date'].min().date()} ~ {panel['date'].max().date()}",
+           "cost_bps": cost_bps, "grid": grid}
+    if json_out:
+        Path(json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(json_out).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sequoia-X 向量化事件研究回测")
+    parser = argparse.ArgumentParser(description="Sequoia-X 向量化事件研究回测 v2")
     parser.add_argument("--period", default="1y", help="回测期间（1y/2y/3y 或全量 all）")
     parser.add_argument("--json-out", help="结果写 JSON")
+    parser.add_argument("--cost-bps", type=int, default=DEFAULT_COST_BPS,
+                        help="双边合计成本基点（默认 25 = 0.25%）")
+    parser.add_argument("--turtle-window", type=int, default=20, help="海龟突破通道窗口")
+    parser.add_argument("--rps-threshold", type=int, default=90, help="RPS 分位阈值")
+    parser.add_argument("--no-portfolio", action="store_true", help="跳过组合层")
+    parser.add_argument("--no-index", action="store_true", help="跳过沪深300 超额对比")
+    parser.add_argument("--grid", action="store_true", help="参数网格模式")
     args = parser.parse_args()
 
-    res = run_backtest(period=args.period, json_out=args.json_out)
-    print(f"回测区间 {res['range']} | {res['n_stocks']} 只 | {res['n_rows']} 行\n")
+    if args.grid:
+        _run_grid(json_out=args.json_out, cost_bps=args.cost_bps)
+        return
+
+    res = run_backtest(
+        period=args.period, json_out=args.json_out, cost_bps=args.cost_bps,
+        turtle_window=args.turtle_window, rps_threshold=args.rps_threshold,
+        with_portfolio=not args.no_portfolio, fetch_index=not args.no_index,
+    )
+    print(f"回测区间 {res['range']} | {res['n_stocks']} 只(含退市) | {res['n_rows']} 行 | 成本 {args.cost_bps}bp\n")
     for name, horizons in res["strategies"].items():
         parts = []
-        for h, s in horizons.items():
-            if s["count"]:
-                parts.append(f"{h}日: n={s['count']} 胜率{s['win_rate']}% 均{s['mean_ret']}%")
+        for h in (5, 10, 20):
+            s = horizons.get(h) or {}
+            if s.get("count"):
+                parts.append(
+                    f"{h}日: n={s['count']} 胜率{s['win_rate']}% 均{s['mean_ret']}%"
+                    f" [{s['ci_low']},{s['ci_high']}]"
+                )
             else:
                 parts.append(f"{h}日: 无")
-        print(f"【{name}】{' | '.join(parts)}")
+        pf = horizons.get("portfolio")
+        pf_s = ""
+        if pf:
+            pf_s = f" | 组合: 年化{pf['ann_ret']}% 回撤{pf['max_drawdown']}%" \
+                   + (f" 超额{pf['excess']}%" if "excess" in pf else "")
+        mae = horizons.get("mae")
+        mae_s = ""
+        if mae:
+            mae_s = f" | MAE: q50={mae.get('mae_q50')} 触发-5%={mae.get('stop5')}%"
+        print(f"【{name}】{' | '.join(parts)}{pf_s}{mae_s}")
 
 
 if __name__ == "__main__":

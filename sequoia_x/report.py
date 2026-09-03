@@ -239,7 +239,7 @@ class ReportBuilder:
         if result.get("backtest"):
             bt = result["backtest"]
             lines.append("")
-            lines.append(f"📊 回测参考（{bt['range']}，信号日次日买入→N日卖出，不含手续费）")
+            lines.append(f"📊 回测参考（{bt['range']}，次日买入→N日卖出，已含双边成本 {bt.get('cost_bps', 25)}bp）")
             for name, hs in bt["strategies"].items():
                 if not any(v.get("count") for v in hs.values()):
                     continue
