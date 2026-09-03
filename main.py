@@ -29,12 +29,26 @@ from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 
 
+def last_trade_date(engine) -> str:
+    """本地库内最新交易日。"""
+    import sqlite3
+
+    with sqlite3.connect(engine.db_path) as conn:
+        row = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
+    return row[0] if row else ""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
     parser.add_argument(
         "--backfill",
         action="store_true",
         help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
+    )
+    parser.add_argument(
+        "--json-out",
+        metavar="PATH",
+        help="日常模式：将各策略选股原始结果写入 JSON 文件（每策略代码列表）",
     )
     args = parser.parse_args()
 
@@ -76,11 +90,13 @@ def main() -> None:
         notifier = FeishuNotifier(settings)
 
         # 5. 遍历策略，有结果则推送至对应机器人
+        all_results: dict[str, list[str]] = {}
         for strategy in strategies:
             strategy_name = type(strategy).__name__
             logger.info(f"执行策略：{strategy_name}")
 
             selected: list[str] = strategy.run()
+            all_results[strategy_name] = selected
             logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
             if selected:
@@ -91,6 +107,21 @@ def main() -> None:
                 )
             else:
                 logger.info(f"{strategy_name} 无选股结果，跳过推送")
+
+        # 6. 落盘原始选股结果（供投递/归档/回测）
+        if args.json_out:
+            import json
+            from pathlib import Path
+
+            payload = {
+                "date": date.today().isoformat(),
+                "data_date": last_trade_date(engine),
+                "strategies": all_results,
+            }
+            path = Path(args.json_out)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"选股结果已写入: {path}")
 
     except Exception:
         try:
