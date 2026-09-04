@@ -260,11 +260,15 @@ def track(state: dict) -> None:
                 (ed, latest)).fetchall()]
         if not days:
             continue
-        # 逐日市值 = Σ qty×close（用每只股票当日 close）
+        # 买入后不再卖出 → 现金恒定 = 本金 − Σ(股数×买入价) − 买入佣金；
+        # 权益 = 现金 + Σ(股数×当日收盘)（⚠️ 2026-09-04 修复：原实现漏算闲置现金，
+        # 100 股整手取整后通常有 ~7% 现金未投，导致权益被低估）
+        invested = sum(e["qty"] * e["price"] for e in b["entries"])
+        cash = CAPITAL - invested - invested * COMMISSION
         equity_series = []
         hs_series = []
         for d in days:
-            mv = 0.0
+            mv = cash
             for e in b["entries"]:
                 code = e["code"]
                 with _conn() as c:
