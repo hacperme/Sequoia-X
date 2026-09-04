@@ -11,6 +11,10 @@
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_PY="$PROJ/.venv/bin/python"
 DATA_DIR="$PROJ/data"
+# ⚠️ pipefail（2026-09-04）：gen_report 走 "| grep -v" 管道，无 pipefail 时 grep 退出码
+#    会掩盖 report 被 timeout 截杀（exit 124）——曾致超时后静默沿用旧 daily_report.json
+#    （tracker/摘要读到 09-03 旧数据）。加 pipefail 让管道如实返回首条失败退出码。
+set -o pipefail
 
 # 1. 增量同步（单进程串行——baostock 并发触发风控 2026-09-04；全市场 5215 只
 #    实测 ~0.19s/只 ≈ 16 分钟，2026-09-04 实际 ~0.23s/只 ≈ 20 分钟，故超时给 1800s；
@@ -74,7 +78,7 @@ BT_CODE=$?
 # 6. 生成日报 JSON（选股 + 回测参考缓存）+ markdown
 REPORT_JSON="$DATA_DIR/daily_report.json"
 gen_report() {
-    (cd "$PROJ" && timeout 300 $VENV_PY -m sequoia_x.report \
+    (cd "$PROJ" && timeout 600 $VENV_PY -m sequoia_x.report \
         --json-out "$REPORT_JSON" 2>&1) | grep -vE "INFO|login|logout" >/dev/null
 }
 gen_report
