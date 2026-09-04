@@ -47,8 +47,3 @@ def is_limit_down(prev_close: float, close: float, symbol: str) -> bool:
     if prev_close <= 0:
         return False
     return close <= prev_close * limit_down_ratio(symbol)
-
-
-def limit_ratio_series(symbols: "list[str]") -> "dict[str, float]":
-    """批量：symbol → 涨停倍率映射（回测 panel 建列用）。"""
-    return {s: _ratio(s) for s in symbols}

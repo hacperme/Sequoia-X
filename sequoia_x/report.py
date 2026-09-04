@@ -30,26 +30,14 @@ load_dotenv()
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
+from sequoia_x.strategy import STRATEGY_REGISTRY
 from sequoia_x.strategy.base import BaseStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
-from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 
 logger = get_logger(__name__)
 
-# 默认策略集：(策略类, 中文名)
+# 默认策略集：(策略类, 中文名)——源自中央注册表，避免与 main/backtest 漂移
 DEFAULT_STRATEGIES: list[tuple[type[BaseStrategy], str]] = [
-    (TurtleTradeStrategy, "海龟突破"),
-    (MaVolumeStrategy, "均线放量"),
-    (HighTightFlagStrategy, "高窄旗形"),
-    (LimitUpShakeoutStrategy, "涨停洗盘"),
-    (UptrendLimitDownStrategy, "上升跌停"),
-    (RpsBreakoutStrategy, "RPS 突破"),
-    (PrivatePlacementStrategy, "定增公告"),
+    (spec.cls, spec.cn_name) for spec in STRATEGY_REGISTRY
 ]
 
 

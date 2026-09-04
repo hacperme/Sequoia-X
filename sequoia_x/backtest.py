@@ -81,23 +81,20 @@ def compute_events(
     不一致、高窄旗形缺高位抗跌等漂移）。panel 需由 _load_panel 准备
     （含 prev_close/lim_up/lim_dn）。
     """
-    from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-    from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-    from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-    from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-    from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-    from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
+    from sequoia_x.strategy import STRATEGY_REGISTRY
 
-    # 策略名 → (类, 参数覆盖)。窗口/阈值参数化供网格 _run_grid 用
+    # 策略名 → (类, 参数覆盖)，源自中央注册表（仅 backtest=True 参与）。
+    # 窗口/阈值参数化供网格 _run_grid 用。
     registry: dict[str, tuple[type, dict]] = {
-        "海龟突破": (TurtleTradeStrategy, {"breakout_window": turtle_window}),
-        "均线放量": (MaVolumeStrategy, {}),
-        "高窄旗形": (HighTightFlagStrategy, {}),
-        "涨停洗盘": (LimitUpShakeoutStrategy, {}),
-        "上升跌停": (UptrendLimitDownStrategy, {}),
-        "RPS 突破": (RpsBreakoutStrategy,
-                     {"rps_period": rps_period, "rps_threshold": rps_threshold}),
+        spec.cn_name: (spec.cls, {}) for spec in STRATEGY_REGISTRY if spec.backtest
     }
+    if "海龟突破" in registry:
+        registry["海龟突破"] = (registry["海龟突破"][0], {"breakout_window": turtle_window})
+    if "RPS 突破" in registry:
+        registry["RPS 突破"] = (
+            registry["RPS 突破"][0],
+            {"rps_period": rps_period, "rps_threshold": rps_threshold},
+        )
 
     def mask_to_events(mask: pd.Series) -> pd.DataFrame:
         return panel.loc[mask, ["symbol", "date", "seq"]].reset_index(drop=True)
