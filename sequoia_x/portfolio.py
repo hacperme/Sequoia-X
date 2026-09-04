@@ -61,6 +61,54 @@ def _add_atr(panel: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
+def _add_features(panel: pd.DataFrame) -> pd.DataFrame:
+    """信号质量评分所需特征列（全表向量化）。"""
+    g = panel.groupby("symbol", sort=False)
+    panel["hi40"] = g["high"].transform(lambda s: s.rolling(40).max())
+    panel["lo40"] = g["low"].transform(lambda s: s.rolling(40).min())
+    panel["hi10"] = g["high"].transform(lambda s: s.rolling(10).max())
+    panel["lo10"] = g["low"].transform(lambda s: s.rolling(10).min())
+    panel["vol_ma20"] = g["volume"].transform(lambda s: s.rolling(20).mean())
+    panel["high20_prev"] = g["high"].transform(
+        lambda s: s.shift(1).rolling(20).max()
+    )
+    return panel
+
+
+def _score_events(panel: pd.DataFrame, events: pd.DataFrame, name: str) -> pd.DataFrame:
+    """给事件附横截面质量分（当日全部信号内 rank 均值，越大越优先入场）。
+
+    策略各自的"信号质量"直觉（P1 研究用，参数非定论）：
+    - 高窄旗形：收敛越紧、缩量越深 → 越接近变盘点（rank 1/(hi10/lo10) + rank vol_ma20/volume）
+    - 海龟突破：突破幅度越小（刚突破）越新鲜，幅度大=已透支（rank -幅度）
+    - 均线放量：放量倍数越大动能越强（rank volume/vol_ma20）
+    其余策略无明确排序 → score 恒 0（随机先到先得，与 P0 一致）。
+    """
+    ev = events.copy()
+    need = ["symbol", "date", "hi40", "lo40", "hi10", "lo10", "vol_ma20",
+            "volume", "high20_prev", "close"]
+    cols = ev[["symbol", "date"]].merge(
+        panel[need], on=["symbol", "date"], how="left"
+    )
+    if name == "高窄旗形":
+        m1 = 1 / (cols["hi10"] / cols["lo10"])          # 收敛（触发即 <1.15，越紧越大）
+        m2 = cols["vol_ma20"] / cols["volume"]          # 缩量（触发即 <0.6 均量，越深越大）
+        score = (
+            m1.groupby(cols["date"]).rank(pct=True)
+            + m2.groupby(cols["date"]).rank(pct=True)
+        ) / 2 * 100
+    elif name == "海龟突破":
+        m = cols["close"] / cols["high20_prev"] - 1     # 突破幅度，越小=刚突破
+        score = (-m).groupby(cols["date"]).rank(pct=True) * 100
+    elif name == "均线放量":
+        m = cols["volume"] / cols["vol_ma20"]
+        score = m.groupby(cols["date"]).rank(pct=True) * 100
+    else:
+        score = pd.Series(0.0, index=ev.index)
+    ev["score"] = score.fillna(0.0).values
+    return ev
+
+
 class PortfolioSim:
     """单策略组合模拟器。"""
 
@@ -97,8 +145,12 @@ class PortfolioSim:
             self._px[s] = g.set_index("date")
 
         # 信号按日期聚合（收盘后确认，次日开盘执行）
+        # 若事件带 score 列：当日按 score 降序（质量优先入场）；否则保持原序（先到先得）
+        self.by_quality = "score" in self.events.columns
         self.signal_by_date: dict[pd.Timestamp, list[str]] = {}
         for d, g in self.events.groupby("date"):
+            if self.by_quality:
+                g = g.sort_values("score", ascending=False)
             self.signal_by_date[d] = list(g["symbol"])
 
         self.dates = sorted(panel["date"].unique())
@@ -294,12 +346,15 @@ def run_portfolio(
     hold_days: int = DEFAULT_HOLD,
     stop_loss: float = DEFAULT_STOP,
     chandelier_k: float = CHANDELIER_K,
+    by_quality: bool = False,
+    combined: bool = False,
     json_out: str | None = None,
 ) -> dict:
     settings = get_settings()
     engine = DataEngine(settings)
     panel = _load_panel(engine.db_path)   # 已含 lim_up/lim_dn/prev_close（全量口径）
     panel = _add_atr(panel)               # ATR 全量算，过滤后窗口首日即有值
+    panel = _add_features(panel)          # 评分特征
     if period.endswith("y"):
         years = int(period[:-1])
         cutoff = panel["date"].max() - pd.DateOffset(years=years)
@@ -307,20 +362,45 @@ def run_portfolio(
     panel["seq"] = panel.groupby("symbol").cumcount()
 
     events = compute_events(panel, strategies=strategies)
+    if by_quality:
+        events = {n: _score_events(panel, ev, n) for n, ev in events.items()}
     out: dict[str, dict] = {}
-    for name, ev in events.items():
+
+    if combined and events:
+        # 多策略联合组合：全部策略事件合并，同 (symbol,date) 多策略命中只保留一次
+        # （quality 模式保留分最高者；否则保留首个）
+        merged = pd.concat(
+            [ev.assign(strategy=n) for n, ev in events.items()],
+            ignore_index=True,
+        )
+        if by_quality:
+            merged = merged.sort_values("score", ascending=False) \
+                .drop_duplicates(subset=["symbol", "date"]).reset_index(drop=True)
+        else:
+            merged = merged.drop_duplicates(subset=["symbol", "date"]).reset_index(drop=True)
         sim = PortfolioSim(
-            panel, ev, capital=capital, max_pos=max_pos, daily_k=daily_k,
+            panel, merged, capital=capital, max_pos=max_pos, daily_k=daily_k,
             pos_size=pos_size, cost_bps=cost_bps, hold_days=hold_days,
             exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
         )
-        out[name] = sim.run()
-        logger.info(f"{name} 组合模拟完成（exit={exit_mode}）")
+        out["多策略联合"] = sim.run()
+        logger.info(f"多策略联合组合模拟完成（exit={exit_mode}, quality={by_quality}）")
+    else:
+        for name, ev in events.items():
+            sim = PortfolioSim(
+                panel, ev, capital=capital, max_pos=max_pos, daily_k=daily_k,
+                pos_size=pos_size, cost_bps=cost_bps, hold_days=hold_days,
+                exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
+            )
+            out[name] = sim.run()
+            logger.info(f"{name} 组合模拟完成（exit={exit_mode} quality={by_quality}）")
     res = {
-        "method": "portfolio-sim-p0",
+        "method": "portfolio-sim-p1",
         "note": (
             f"收盘决策次日开盘成交；exit={exit_mode}；max_pos={max_pos} daily_k={daily_k} "
-            f"pos_size={pos_size} hold={hold_days}d 成本{cost_bps}bp；一手100股；单策略独立100万"
+            f"pos_size={pos_size} hold={hold_days}d 成本{cost_bps}bp；一手100股；"
+            f"{'quality 质量排序入场' if by_quality else '先到先得'}"
+            f"{'；多策略联合' if combined else ''}"
         ),
         "range": f"{panel['date'].min().date()} ~ {panel['date'].max().date()}",
         "strategies": out,
@@ -363,6 +443,10 @@ def main() -> None:
     parser.add_argument("--hold-days", type=int, default=DEFAULT_HOLD)
     parser.add_argument("--stop-loss", type=float, default=DEFAULT_STOP)
     parser.add_argument("--chandelier-k", type=float, default=CHANDELIER_K)
+    parser.add_argument("--quality", action="store_true",
+                        help="按信号质量分排序入场（默认先到先得）")
+    parser.add_argument("--combined", action="store_true",
+                        help="多策略联合组合（同一资金池）")
     parser.add_argument("--json-out")
     args = parser.parse_args()
 
@@ -371,6 +455,7 @@ def main() -> None:
         capital=args.capital, max_pos=args.max_pos, daily_k=args.daily_k,
         pos_size=args.pos_size, cost_bps=args.cost_bps, hold_days=args.hold_days,
         stop_loss=args.stop_loss, chandelier_k=args.chandelier_k,
+        by_quality=args.quality, combined=args.combined,
         json_out=args.json_out,
     )
     _print_res(res)
