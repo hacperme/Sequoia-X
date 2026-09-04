@@ -53,24 +53,70 @@ CREATE INDEX IF NOT EXISTS idx_delisted_symbol_date ON stock_daily_delisted (sym
 
 
 def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+    """多进程 worker：独立 login，批量拉取 baostock 数据。
+
+    容错（2026-09-04 增强，解决"baostock 偶发失败"）：
+    - 每只失败自动重试 3 次（2s/4s/8s 退避），每次失败 logout+login 重连
+      （对齐 backfill 的成熟模式；此前 sync 无重试，单次网络抖动即丢当日数据）
+    - 3 次仍失败跳过并记日志（该股留待下次 sync 补，不中断整批）
+    """
+    import time
+
     import baostock as bs
-    bs.login()
+
+    logger = __import__("logging").getLogger(__name__)
+    lg = bs.login()
+    if lg.error_code != "0":
+        logger.error(f"[worker] baostock 登录失败: {lg.error_msg}")
+        return []
     results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
+    max_retries = 3
+    try:
+        for symbol, bs_code, start, end in tasks:
+            rows: list[list[str]] = []
+            ok = False
+            for attempt in range(max_retries):
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount",
+                        start_date=start,
+                        end_date=end,
+                        frequency="d",
+                        adjustflag="1",  # 后复权
+                    )
+                    if rs.error_code != "0":
+                        raise RuntimeError(rs.error_msg)
+                    while rs.next():
+                        rows.append(rs.get_row_data())
+                    ok = True
+                    break
+                except Exception as exc:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** (attempt + 1)
+                        logger.warning(
+                            f"[{symbol}] sync 第{attempt + 1}次失败: {exc}，"
+                            f"{wait}s 后重连重试"
+                        )
+                        time.sleep(wait)
+                        try:
+                            bs.logout()
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                        try:
+                            bs.login()
+                        except Exception as exc2:
+                            logger.warning(f"[worker] 重连失败: {exc2}")
+                    else:
+                        logger.warning(f"[{symbol}] sync {max_retries} 次重试均失败，跳过")
+            if ok:
+                results.extend([symbol] + r for r in rows)
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
     return results
 
 
