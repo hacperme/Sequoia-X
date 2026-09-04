@@ -158,12 +158,10 @@ class ReportBuilder:
 
         {
           "date": "2026-09-02",
-          "strategies": [
-            {"name": "海龟突破", "count": 78, "top": ["600674", ...], "detail": [{code,name,cap,hits}]},
-            ...
-          ],
-          "cross_hits": [{"code","name","cap","strategies":[...]}],   # 多策略共振
-          "filtered": {"st": 9, "new": 2, "cap_range": 88},            # 过滤统计
+          "generated_at": "...",
+          "strategies": [{"name", "count_total", "count_in_range", "top": [code...]}],
+          "cross_hits": [{"code","name","cap_yi","strategies"}],   # 多策略共振
+          "regime": {"regime": "up_low", "date": "..."}            # 市场状态（asof）
         }
         """
         self.meta.load()

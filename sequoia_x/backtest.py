@@ -74,36 +74,30 @@ def compute_events(
     rps_period: int = 120,
     rps_threshold: int = 90,
 ) -> dict[str, pd.DataFrame]:
-    """对每个策略算出信号事件表 {strategy: DataFrame[symbol, date, seq]}。全表向量化。"""
-    g = panel.groupby("symbol", sort=False)
-    close = panel["close"]
-    open_ = panel["open"]
-    high = panel["high"]
-    low = panel["low"]
-    volume = panel["volume"]
-    amount = panel["turnover"]  # 真实成交额（baostock amount 字段，入库时列名 turnover）
-    feats = {
-        "close": close,
-        "open": open_,
-        "volume": volume,
-        "ma5": g["close"].transform(lambda s: s.rolling(5).mean()),
-        "ma20": g["close"].transform(lambda s: s.rolling(20).mean()),
-        "vol_ma20": g["volume"].transform(lambda s: s.rolling(20).mean()),
-        "ma60": g["close"].transform(lambda s: s.rolling(60).mean()),
-        "close_prev": g["close"].transform(lambda s: s.shift(1)),
-        "close_prev2": g["close"].transform(lambda s: s.shift(2)),
-        "vol_prev": g["volume"].transform(lambda s: s.shift(1)),
-        "hi40": g["high"].transform(lambda s: s.rolling(40).max()),
-        "lo40": g["low"].transform(lambda s: s.rolling(40).min()),
-        "hi10": g["high"].transform(lambda s: s.rolling(10).max()),
-        "lo10": g["low"].transform(lambda s: s.rolling(10).min()),
+    """对每个策略算出信号事件表 {strategy: DataFrame[symbol, date, seq]}。
+
+    P0 重构（2026-09-04）：改为**驱动**——调用各策略类 signal_mask()
+    （权威向量化实现），不再复制粘贴信号条件（原双实现导致 RPS shift(1)
+    不一致、高窄旗形缺高位抗跌等漂移）。panel 需由 _load_panel 准备
+    （含 prev_close/lim_up/lim_dn）。
+    """
+    from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
+    from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
+    from sequoia_x.strategy.ma_volume import MaVolumeStrategy
+    from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
+    from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
+    from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
+
+    # 策略名 → (类, 参数覆盖)。窗口/阈值参数化供网格 _run_grid 用
+    registry: dict[str, tuple[type, dict]] = {
+        "海龟突破": (TurtleTradeStrategy, {"breakout_window": turtle_window}),
+        "均线放量": (MaVolumeStrategy, {}),
+        "高窄旗形": (HighTightFlagStrategy, {}),
+        "涨停洗盘": (LimitUpShakeoutStrategy, {}),
+        "上升跌停": (UptrendLimitDownStrategy, {}),
+        "RPS 突破": (RpsBreakoutStrategy,
+                     {"rps_period": rps_period, "rps_threshold": rps_threshold}),
     }
-    # 海龟窗口可参数化（网格）
-    feats["hiW_prev"] = g["high"].transform(
-        lambda s: s.shift(1).rolling(turtle_window).max()
-    )
-    feats["ma20_prev"] = feats["ma20"].shift(1)
-    feats["ma60_prev"] = feats["ma60"].shift(1)
 
     def mask_to_events(mask: pd.Series) -> pd.DataFrame:
         return panel.loc[mask, ["symbol", "date", "seq"]].reset_index(drop=True)
@@ -124,52 +118,16 @@ def compute_events(
                 keep.append(False)
         return ev.loc[keep].reset_index(drop=True)
 
+    names = strategies or list(registry)
     events: dict[str, pd.DataFrame] = {}
-    if not strategies or "海龟突破" in strategies:
-        # 真实成交额过亿（非 volume×后复权价估算）
-        m = (close > feats["hiW_prev"]) & (amount > 100_000_000) \
-            & (close > open_) & (close > feats["close_prev"])
-        events["海龟突破"] = dedupe(mask_to_events(m.fillna(False)))
-        logger.info(f"海龟突破(W={turtle_window}): {len(events['海龟突破'])} 信号")
-    if not strategies or "均线放量" in strategies:
-        golden = (feats["ma5"].shift(1) <= feats["ma20"].shift(1)) & (feats["ma5"] > feats["ma20"])
-        surge = volume > feats["vol_ma20"] * 1.5
-        events["均线放量"] = dedupe(mask_to_events((golden & surge).fillna(False)))
-        logger.info(f"均线放量: {len(events['均线放量'])} 信号")
-    if not strategies or "高窄旗形" in strategies:
-        m = (feats["hi40"] / feats["lo40"] > 1.6) & (feats["hi10"] / feats["lo10"] < 1.15) \
-            & (volume < feats["vol_ma20"] * 0.6)
-        events["高窄旗形"] = dedupe(mask_to_events(m.fillna(False)))
-        logger.info(f"高窄旗形: {len(events['高窄旗形'])} 信号")
-    if not strategies or "涨停洗盘" in strategies:
-        # 昨涨停（分板幅度）× 今收阴 × 放量 2 倍 × 支撑不破
-        m = (feats["close_prev"] >= feats["close_prev2"] * panel["lim_up"]) \
-            & (close < open_) & (volume > feats["vol_prev"] * 2.0) \
-            & (low >= feats["close_prev"])
-        events["涨停洗盘"] = dedupe(mask_to_events(m.fillna(False)))
-        logger.info(f"涨停洗盘: {len(events['涨停洗盘'])} 信号")
-    if not strategies or "上升跌停" in strategies:
-        # 上升趋势（昨 MA20>MA60）× 跌停（分板幅度）× 放量 2 倍
-        m = (feats["ma20_prev"] > feats["ma60_prev"]) \
-            & (close <= feats["close_prev"] * panel["lim_dn"]) \
-            & (volume > feats["vol_ma20"] * 2.0)
-        events["上升跌停"] = dedupe(mask_to_events(m.fillna(False)))
-        logger.info(f"上升跌停: {len(events['上升跌停'])} 信号")
-    if not strategies or "RPS 突破" in strategies:
-        chg = g["close"].transform(lambda s: s.pct_change(rps_period))
-        high_prev = g["high"].transform(lambda s: s.shift(1).rolling(rps_period).max())
-        tmp = panel[["symbol", "date"]].copy()
-        tmp["chg"] = chg.values
-        tmp["high_prev"] = high_prev.values
-        tmp["close"] = close.values
-        tmp = tmp.dropna(subset=["chg", "high_prev"])
-        tmp["rps"] = tmp.groupby("date")["chg"].rank(pct=True) * 100
-        m = (tmp["rps"] >= rps_threshold) & (tmp["close"] >= tmp["high_prev"] * 0.9)
-        hit = tmp.loc[m, ["symbol", "date"]].merge(
-            panel[["symbol", "date", "seq"]], on=["symbol", "date"], how="left"
-        )
-        events["RPS 突破"] = dedupe(hit.reset_index(drop=True))
-        logger.info(f"RPS 突破(T={rps_threshold}): {len(events['RPS 突破'])} 信号")
+    for name in names:
+        cls, params = registry[name]
+        strat = cls(engine=None, settings=None)  # signal_mask 纯函数式，不需 engine
+        for k, v in params.items():
+            setattr(strat, k, v)
+        mask = strat.signal_mask(panel)
+        events[name] = dedupe(mask_to_events(mask))
+        logger.info(f"{name}: {len(events[name])} 信号")
     return events
 
 
@@ -359,7 +317,22 @@ def _portfolio(panel: pd.DataFrame, events: pd.DataFrame, h: int,
 
 
 def _fetch_index(index_code: str = "sh.000300", days_back: int = 800) -> pd.DataFrame | None:
-    """现拉沪深300 日线（后复权 close），供组合层超额对比；失败返回 None 不阻塞。"""
+    """取沪深300 日线（后复权 close），供组合层超额对比。
+
+    P2 优化（2026-09-04）：优先读 regime 本地 index_daily 缓存（快、免网络），
+    本地缺失再 baostock 现拉；失败返回 None 不阻塞。
+    """
+    try:
+        from sequoia_x.core.config import get_settings
+        from sequoia_x.regime import read_index_daily
+
+        db_path = get_settings().db_path
+        local = read_index_daily(db_path)
+        if not local.empty:
+            local = local[local["date"] >= pd.Timestamp.now() - pd.Timedelta(days=days_back)]
+            return local.dropna(subset=["close"]).reset_index(drop=True)
+    except Exception as exc:
+        logger.warning(f"本地指数读取失败（转 baostock）：{exc}")
     try:
         import baostock as bs
         from datetime import date, timedelta

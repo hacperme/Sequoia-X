@@ -34,7 +34,7 @@ class MaVolumeStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
-                if len(df) < 20:
+                if len(df) < 20 or not self._df_is_current(df):
                     continue
 
                 # 向量化计算均线和成交量均值
@@ -61,3 +61,13 @@ class MaVolumeStrategy(BaseStrategy):
 
         logger.info(f"MaVolumeStrategy 选出 {len(selected)} 只股票")
         return selected
+
+    def signal_mask(self, panel: pd.DataFrame) -> pd.Series:
+        """权威向量化信号（与 run() 同口径）：5 日金叉 20 日 ∧ 放量 >1.5×20日均量。"""
+        g = panel.groupby("symbol", sort=False)
+        ma5 = g["close"].transform(lambda s: s.rolling(5).mean())
+        ma20 = g["close"].transform(lambda s: s.rolling(20).mean())
+        vol_ma20 = g["volume"].transform(lambda s: s.rolling(20).mean())
+        golden = (ma5.shift(1) <= ma20.shift(1)) & (ma5 > ma20)
+        surge = panel["volume"] > vol_ma20 * 1.5
+        return (golden & surge).fillna(False)

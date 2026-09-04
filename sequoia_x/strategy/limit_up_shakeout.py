@@ -38,7 +38,7 @@ class LimitUpShakeoutStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
-                if len(df) < self._MIN_BARS:
+                if len(df) < self._MIN_BARS or not self._df_is_current(df):
                     continue
 
                 # 取最近三根 K 线（向量化索引，无 iterrows）
@@ -64,3 +64,19 @@ class LimitUpShakeoutStrategy(BaseStrategy):
 
         logger.info(f"LimitUpShakeoutStrategy 选出 {len(selected)} 只股票")
         return selected
+
+    def signal_mask(self, panel: pd.DataFrame) -> pd.Series:
+        """权威向量化信号（与 run() 同口径）：昨涨停(分板) ∧ 今收阴 ∧ 放量2倍 ∧ 支撑不破。
+
+        panel 需含 lim_up 列（=该股涨停倍率，1.098/1.196/1.294）。
+        """
+        g = panel.groupby("symbol", sort=False)
+        close_prev = g["close"].transform(lambda s: s.shift(1))
+        close_prev2 = g["close"].transform(lambda s: s.shift(2))
+        vol_prev = g["volume"].transform(lambda s: s.shift(1))
+        return (
+            (close_prev >= close_prev2 * panel["lim_up"])  # 昨涨停（分板）
+            & (panel["close"] < panel["open"])             # 今收阴
+            & (panel["volume"] > vol_prev * 2.0)           # 放量
+            & (panel["low"] >= close_prev)                 # 支撑不破昨收
+        ).fillna(False)

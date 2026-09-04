@@ -22,6 +22,7 @@ class TurtleTradeStrategy(BaseStrategy):
 
     webhook_key: str = "turtle"
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
+    breakout_window: int = 20  # 突破通道窗口（网格可覆盖 40/55）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
         """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
@@ -74,8 +75,8 @@ class TurtleTradeStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
-                if len(df) < self._MIN_BARS:
-                    continue
+                if len(df) < self._MIN_BARS or not self._df_is_current(df):
+                    continue  # 停牌/数据未到最新日跳过
 
                 # 向量化：前20日 high 的滚动最大值（不含当日，shift(1) 后取 rolling(20)）
                 df["high_20"] = df["high"].shift(1).rolling(20).max()
@@ -109,3 +110,21 @@ class TurtleTradeStrategy(BaseStrategy):
 
         logger.info(f"TurtleTradeStrategy 选出 {len(candidates)} 只股票")
         return candidates
+
+    def signal_mask(self, panel: pd.DataFrame) -> pd.Series:
+        """权威向量化信号（与 run() 同口径，供回测 compute_events）。
+
+        条件（与 run() 一致）：close > 前 breakout_window 日 high 最大（shift 防未来）
+        ∧ 成交额(turnover 列) > 1 亿 ∧ 阳线(close>open) ∧ 真涨(close>昨收)。
+        """
+        g = panel.groupby("symbol", sort=False)
+        high_w = g["high"].transform(
+            lambda s: s.shift(1).rolling(self.breakout_window).max()
+        )
+        close_prev = g["close"].transform(lambda s: s.shift(1))
+        return (
+            (panel["close"] > high_w)
+            & (panel["turnover"] > 100_000_000)
+            & (panel["close"] > panel["open"])
+            & (panel["close"] > close_prev)
+        ).fillna(False)

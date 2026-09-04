@@ -16,7 +16,10 @@
 
 用法：
     python -m sequoia_x.portfolio --strategy 高窄旗形 --exit chandelier --json-out data/portfolio_htf_ch.json
-    python -m sequoia_x.portfolio --all-exits --json-out data/portfolio_compare.json
+    python -m sequoia_x.portfolio --strategy 海龟突破 --strategy 高窄旗形 --combined --json-out pf.json
+    # 选项：--exit time|stop|chandelier；--max-pos/--daily-k/--hold-days/--stop-loss/
+    #       --chandelier-k/--capital/--pos-size/--cost-bps；--quality 质量排序；
+    #       --combined 多策略联合；--regime-filter 状态机过滤；--risk-budget 状态仓位
 """
 from __future__ import annotations
 
@@ -163,6 +166,7 @@ class PortfolioSim:
         self.cash = capital
         self.positions: dict[str, dict] = {}      # symbol -> 持仓详情
         self.trades: list[dict] = []
+        self._row_cache: dict[tuple, pd.Series | None] = {}  # P1a: 当日 bar 缓存
         self.stats = {"entry_blocked": 0, "skipped_cap": 0, "skipped_cash": 0,
                       "skipped_budget": 0,
                       "exit_extended": 0, "exit_still_blocked": 0,
@@ -170,10 +174,18 @@ class PortfolioSim:
 
     # ── 行情查询 ──
     def _row(self, symbol: str, d: pd.Timestamp) -> pd.Series | None:
+        """当日 bar（P1a 性能优化：同日重复访问同一持仓走缓存，省 Series 重建）。"""
+        key = (symbol, d)
+        hit = self._row_cache.get(key)
+        if hit is not None:
+            return hit if hit is not ... else None
         df = self._px.get(symbol)
         if df is None or d not in df.index:
+            self._row_cache[key] = ...
             return None
-        return df.loc[d]
+        row = df.loc[d]
+        self._row_cache[key] = row
+        return row
 
     # ── 卖出队列：每日开盘先处理（顺延逻辑）──
     def _process_sells(self, d: pd.Timestamp) -> None:
@@ -315,6 +327,7 @@ class PortfolioSim:
         self._pending_buy: dict[str, bool] = {}
         nav: list[dict] = []
         for d in self.dates:
+            self._row_cache = {}  # P1a: 每日清 bar 缓存（键含日期无需逐日清，防无限增长双保险）
             self._process_sells(d)
             # 开盘执行昨日挂的买单（当日多个信号同日时按信号序；简单逐日先到先得）
             if self._pending_buy:

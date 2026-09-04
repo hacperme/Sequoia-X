@@ -54,3 +54,27 @@ class RpsBreakoutStrategy(BaseStrategy):
 
         logger.info(f"RpsBreakoutStrategy 选出 {len(selected)} 只股票")
         return selected['symbol'].tolist()
+
+    def signal_mask(self, panel: pd.DataFrame) -> pd.Series:
+        """权威向量化信号（与 run() 同口径）：120 日涨幅横截面 rank≥阈值 ∧ 收盘≥前120日高×0.9。
+
+        注意：横截面指标，需全市场同日数据。roll_high 用 shift(1) 防未来函数。
+        参数：self.rps_period（默认 120）/ self.rps_threshold（默认 90）。
+        """
+        g = panel.groupby("symbol", sort=False)
+        chg = g["close"].transform(
+            lambda s: s.pct_change(self.rps_period)
+        )
+        high_prev = g["high"].transform(
+            lambda s: s.shift(1).rolling(self.rps_period).max()
+        )
+        tmp = panel[["symbol", "date"]].copy()
+        tmp["chg"] = chg.values
+        tmp["high_prev"] = high_prev.values
+        tmp["close"] = panel["close"].values
+        tmp = tmp.dropna(subset=["chg", "high_prev"])
+        rps = tmp.groupby("date")["chg"].rank(pct=True) * 100
+        hit = (rps >= self.rps_threshold) & (tmp["close"] >= tmp["high_prev"] * 0.9)
+        out = pd.Series(False, index=panel.index)
+        out.loc[tmp.index[hit.values]] = True
+        return out

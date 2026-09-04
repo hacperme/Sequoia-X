@@ -37,7 +37,7 @@ class UptrendLimitDownStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
-                if len(df) < self._MIN_BARS:
+                if len(df) < self._MIN_BARS or not self._df_is_current(df):
                     continue
 
                 # 向量化计算均线
@@ -66,3 +66,19 @@ class UptrendLimitDownStrategy(BaseStrategy):
 
         logger.info(f"UptrendLimitDownStrategy 选出 {len(selected)} 只股票")
         return selected
+
+    def signal_mask(self, panel: pd.DataFrame) -> pd.Series:
+        """权威向量化信号（与 run() 同口径）：昨多头(MA20>MA60) ∧ 跌停(分板) ∧ 放量2倍。
+
+        panel 需含 lim_dn 列（跌停倍率）。MA 用 shift(1) 前值防未来。
+        """
+        g = panel.groupby("symbol", sort=False)
+        ma20 = g["close"].transform(lambda s: s.rolling(20).mean())
+        ma60 = g["close"].transform(lambda s: s.rolling(60).mean())
+        vol_ma20 = g["volume"].transform(lambda s: s.rolling(20).mean())
+        close_prev = g["close"].transform(lambda s: s.shift(1))
+        return (
+            (ma20.shift(1) > ma60.shift(1))                # 昨多头排列（run 用 prev）
+            & (panel["close"] <= close_prev * panel["lim_dn"])  # 今跌停（分板）
+            & (panel["volume"] > vol_ma20 * 2.0)           # 放量 2 倍
+        ).fillna(False)

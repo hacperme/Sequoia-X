@@ -36,7 +36,7 @@ class HighTightFlagStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
-                if len(df) < self._MIN_BARS:
+                if len(df) < self._MIN_BARS or not self._df_is_current(df):
                     continue
 
                 # 向量化计算各窗口指标
@@ -70,3 +70,27 @@ class HighTightFlagStrategy(BaseStrategy):
 
         logger.info(f"HighTightFlagStrategy 选出 {len(selected)} 只股票")
         return selected
+
+    def signal_mask(self, panel: pd.DataFrame) -> pd.Series:
+        """权威向量化信号（与 run() 同口径，含**高位抗跌**条件）。
+
+        条件：强动量 hi40/lo40>1.6 ∧ 极度收敛 hi10/lo10<1.15 ∧
+        高位抗跌 low10 ≥ hi40×0.8 ∧ 缩量 volume < 20日均量×0.6。
+
+        ⚠️ 修复历史漂移：compute_events 旧实现缺"高位抗跌"→ 回测信号多于实盘。
+        """
+        g = panel.groupby("symbol", sort=False)
+        hi40 = g["high"].transform(lambda s: s.rolling(40).max())
+        lo40 = g["low"].transform(lambda s: s.rolling(40).min())
+        hi10 = g["high"].transform(lambda s: s.rolling(10).max())
+        lo10 = g["low"].transform(lambda s: s.rolling(10).min())
+        # 缩量基准：前一日为止的 20 日均量（对齐 run() 的 iloc[-21:-1]，不含当日）
+        vol_ma20_excl = g["volume"].transform(
+            lambda s: s.shift(1).rolling(20).mean()
+        )
+        return (
+            (hi40 / lo40 > 1.6)
+            & (hi10 / lo10 < 1.15)
+            & (lo10 >= hi40 * 0.8)  # 高位抗跌（run() 有、旧回测缺）
+            & (panel["volume"] < vol_ma20_excl * 0.6)
+        ).fillna(False)

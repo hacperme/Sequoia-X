@@ -79,6 +79,20 @@ def _fetch_index_history(db_path: str, start: str = "2023-01-01") -> int:
     return len(df)
 
 
+def read_index_daily(db_path: str) -> pd.DataFrame:
+    """读本地 index_daily 表（date, close）。无表/无数据返回空 DataFrame。"""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(_INDEX_TABLE)
+        df = pd.read_sql(
+            "SELECT date, close FROM index_daily WHERE code = ? ORDER BY date",
+            conn, params=(INDEX_CODE,),
+        )
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
 def get_market_states(db_path: str, refresh: bool = True) -> pd.DataFrame:
     """返回 date → market_state 序列（DataFrame: date, trend, vol, regime）。
 
