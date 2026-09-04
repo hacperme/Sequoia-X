@@ -348,6 +348,7 @@ def run_portfolio(
     chandelier_k: float = CHANDELIER_K,
     by_quality: bool = False,
     combined: bool = False,
+    regime_filter: bool = False,
     json_out: str | None = None,
 ) -> dict:
     settings = get_settings()
@@ -364,6 +365,13 @@ def run_portfolio(
     events = compute_events(panel, strategies=strategies)
     if by_quality:
         events = {n: _score_events(panel, ev, n) for n, ev in events.items()}
+    if regime_filter:
+        from sequoia_x.regime import get_market_states
+        from sequoia_x.strategy_map import apply_regime_filter
+
+        states = get_market_states(engine.db_path, refresh=True)
+        events, dropped = apply_regime_filter(events, states)
+        logger.info(f"regime 过滤: {dropped}")
     out: dict[str, dict] = {}
 
     if combined and events:
@@ -447,6 +455,8 @@ def main() -> None:
                         help="按信号质量分排序入场（默认先到先得）")
     parser.add_argument("--combined", action="store_true",
                         help="多策略联合组合（同一资金池）")
+    parser.add_argument("--regime-filter", action="store_true",
+                        help="按市场状态机过滤信号（avoid 状态剔除）")
     parser.add_argument("--json-out")
     args = parser.parse_args()
 
@@ -456,6 +466,7 @@ def main() -> None:
         pos_size=args.pos_size, cost_bps=args.cost_bps, hold_days=args.hold_days,
         stop_loss=args.stop_loss, chandelier_k=args.chandelier_k,
         by_quality=args.quality, combined=args.combined,
+        regime_filter=args.regime_filter,
         json_out=args.json_out,
     )
     _print_res(res)
