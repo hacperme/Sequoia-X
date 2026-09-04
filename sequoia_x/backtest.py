@@ -60,6 +60,8 @@ def _load_panel(db_path: str) -> pd.DataFrame:
     # 分板涨跌停倍率（逐行，向量化判定用）
     df["lim_up"] = df["symbol"].map(limit_up_ratio)
     df["lim_dn"] = df["symbol"].map(limit_down_ratio)
+    # 昨收（涨跌停判定用）
+    df["prev_close"] = df.groupby("symbol")["close"].shift(1)
     return df
 
 
@@ -183,6 +185,77 @@ def _future_close(panel: pd.DataFrame, events: pd.DataFrame, h: int) -> pd.Serie
     )
     m = m.sort_values("eid")
     return m["close"].reset_index(drop=True)
+
+
+def _exec_ret(
+    panel: pd.DataFrame, events: pd.DataFrame, h: int,
+    entry_delay: int = 1, max_exit_extend: int = 5,
+) -> tuple[list[float], dict]:
+    """真实可成交口径收益（评审建议，对齐 AKQuant 撮合约束）：
+
+    - 入场：seq+entry_delay 收盘买入；若当日收盘触及涨停（买不进）→ 事件剔除
+    - 退出：seq+h 收盘卖出；若当日收盘触及跌停（卖不出）→ 顺延至首个非跌停日，
+      最多顺延 max_exit_extend 个交易日，仍跌停则按最后一日价成交
+    - 需 panel 带 prev_close / lim_up / lim_dn 列
+    """
+    stats = {"entry_blocked": 0, "exit_extended": 0, "exit_still_blocked": 0}
+    if events.empty:
+        return [], stats
+    ev = events[["symbol", "seq"]].reset_index()
+    ev.columns = ["eid", "symbol", "seq_in"]
+
+    # 入场价
+    ent = ev[["eid", "symbol"]].copy()
+    ent["seq"] = ev["seq_in"] + entry_delay
+    ent = ent.merge(
+        panel[["symbol", "seq", "open", "high", "low", "close",
+               "prev_close", "lim_up", "lim_dn"]],
+        on=["symbol", "seq"], how="left",
+    ).sort_values("eid").reset_index(drop=True)
+
+    # 入场不可成交：收盘触及涨停（涨停价四舍五入容差内）→ 剔除
+    blocked = ent["close"] >= ent["prev_close"] * ent["lim_up"] * 0.995
+    stats["entry_blocked"] = int(blocked.fillna(False).sum())
+    keep = ent.loc[~blocked.fillna(False) & ent["close"].notna()].copy()
+    if keep.empty:
+        return [], stats
+    keep_eids = set(keep["eid"])
+    evk = ev[ev["eid"].isin(keep_eids)]
+
+    # 退出：seq+h 起最多顺延 max_exit_extend 日
+    ex_rows = []
+    for k in range(max_exit_extend + 1):
+        tmp = evk[["eid", "symbol"]].copy()
+        tmp["seq"] = evk["seq_in"] + h + k
+        tmp["k"] = k
+        ex_rows.append(tmp)
+    ext = pd.concat(ex_rows, ignore_index=True)
+    ext = ext.merge(
+        panel[["symbol", "seq", "close", "prev_close", "lim_dn"]],
+        on=["symbol", "seq"], how="left",
+    )
+    ext = ext.dropna(subset=["close"])
+    ext = ext.sort_values(["eid", "k"])
+    # 首个非跌停日（跌停 = close <= prev*lim_dn*1.005）
+    ext["is_ld"] = ext["close"] <= ext["prev_close"] * ext["lim_dn"] * 1.005
+    ext["exit_ok"] = ~ext["is_ld"]
+    # 每事件取首个可卖日；全跌停则取最后一日
+    picks = []
+    for eid, g in ext.groupby("eid"):
+        ok = g[g["exit_ok"]]
+        picks.append(g.iloc[0] if ok.empty else ok.iloc[0])
+    pick_df = pd.DataFrame(picks)
+    stats["exit_extended"] = int((pick_df["k"] > 0).sum())
+    stats["exit_still_blocked"] = int(((pick_df["k"] > 0) & ~pick_df["exit_ok"]).sum())
+
+    merged = keep.merge(pick_df[["eid", "close", "k"]].rename(columns={"close": "exit"}),
+                        on="eid", how="inner")
+    merged = merged.dropna(subset=["close", "exit"])
+    if merged.empty:
+        return [], stats
+    rets = (merged["exit"] / merged["close"] - 1).replace([np.inf, -np.inf], np.nan)
+    rets = rets.dropna()
+    return [r for r in rets if np.isfinite(r)], stats
 
 
 def _future_ret(panel: pd.DataFrame, events: pd.DataFrame, h: int) -> list[float]:
@@ -359,6 +432,18 @@ def run_backtest(
         for h in HORIZONS:
             rets = _future_ret(panel, ev, h)
             result[name][h] = _stats(rets, cost_bps)
+            # 真实可成交口径（入场触涨停剔除 / 退出触跌停顺延）
+            exec_rets, ex_stats = _exec_ret(panel, ev, h)
+            st = _stats(exec_rets, cost_bps)
+            st.update({
+                "entry_blocked": ex_stats["entry_blocked"],
+                "exit_extended": ex_stats["exit_extended"],
+                "exit_still_blocked": ex_stats["exit_still_blocked"],
+                "total_signals": int(len(ev)),
+                "executable": int(st.get("count", 0)),
+                "ideal_count": int(len(rets)),
+            })
+            result[name][f"{h}_exec"] = st
         # MAE/止损统计（固定 10 日窗口）
         result[name]["mae"] = _mae_stats(panel, ev)
         # 简化组合层（10 日持有）
@@ -460,11 +545,16 @@ def main() -> None:
         parts = []
         for h in (5, 10, 20):
             s = horizons.get(h) or {}
+            ex = horizons.get(f"{h}_exec") or {}
             if s.get("count"):
                 parts.append(
-                    f"{h}日: n={s['count']} 胜率{s['win_rate']}% 均{s['mean_ret']}%"
-                    f" [{s['ci_low']},{s['ci_high']}]"
+                    f"{h}日: 理想{s['win_rate']}%/{s['mean_ret']}%"
                 )
+                if ex.get("executable"):
+                    parts.append(
+                        f"可成交{ex['win_rate']}%/{ex['mean_ret']}%"
+                        f"(剔{ex['entry_blocked']}顺延{ex['exit_extended']})"
+                    )
             else:
                 parts.append(f"{h}日: 无")
         pf = horizons.get("portfolio")
