@@ -13,7 +13,8 @@ VENV_PY="$PROJ/.venv/bin/python"
 DATA_DIR="$PROJ/data"
 
 # 1. 增量同步（单进程串行——baostock 并发触发风控 2026-09-04；全市场 5215 只
-#    实测 ~0.19s/只 ≈ 16 分钟，故超时给 1200s；cron 20:00 触发约 20:20 完成）
+#    实测 ~0.19s/只 ≈ 16 分钟，2026-09-04 实际 ~0.23s/只 ≈ 20 分钟，故超时给 1800s；
+#    cron 20:00 触发约 20:22 完成）
 #    注意：同步可能超时 —— 超时不算致命错误，继续尝试生成报告，
 #    数据日正确性由下方 NO_TRADING_DAY 逻辑把关。
 #    SEQUOIA_SKIP_SYNC=1 跳过同步（验证 tracker/report 链路或应急用）
@@ -21,7 +22,7 @@ SYNC_CODE=0
 if [ "$SEQUOIA_SKIP_SYNC" = "1" ]; then
     echo "（注：SEQUOIA_SKIP_SYNC=1 跳过增量同步）" >&2
 else
-    SYNC_OUT=$(cd "$PROJ" && timeout 1200 $VENV_PY main.py 2>&1)
+    SYNC_OUT=$(cd "$PROJ" && timeout 1800 $VENV_PY main.py 2>&1)
     SYNC_CODE=$?
     if [ $SYNC_CODE -ne 0 ] && [ $SYNC_CODE -ne 124 ]; then
         echo "SEQUOIA_ERROR: 同步失败 (exit=$SYNC_CODE)"
@@ -46,7 +47,7 @@ print(conn.execute('SELECT MAX(date) FROM stock_daily').fetchone()[0])
 #    仅当数据日 < 该基准（真非交易日/数据未同步）才 NO_TRADING_DAY。
 #    SEQUOIA_FORCE=1 跳过此检查（一次性验证用）
 if [ "$SEQUOIA_FORCE" != "1" ]; then
-    RECENT_CLOSED=$($VENV_PY -c "
+    RECENT_CLOSED=$(TZ=Asia/Shanghai $VENV_PY -c "
 from datetime import date, datetime, timedelta
 now = datetime.now()
 d = now.date()
