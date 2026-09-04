@@ -192,9 +192,13 @@ class DataEngine:
             logger.info("所有股票已是最新，无需更新")
             return 0
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
+        logger.info(f"需要更新 {len(tasks)} 只股票，启动拉取...")
 
-        n_workers = min(8, len(tasks))
+        # ⚠️ 2026-09-04 修复：baostock 并发登录/查询触发风控
+        # （8 进程并发实测大量 [Errno 9] Bad file descriptor / 接收数据异常 /
+        #  偶发"黑名单用户，请与管理员联系"）→ 改**单进程串行**（用户决策：
+        #  单进程 + wrapper 提高超时），彻底避开并发，牺牲速度换 100% 稳定
+        n_workers = 1
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
         with Pool(n_workers) as pool:
