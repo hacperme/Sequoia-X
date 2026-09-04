@@ -76,11 +76,14 @@ def regime_markdown(regime: str, strategy_names: list[str]) -> str:
     if focus:
         lines.append(f"  🎯 主攻策略：{' '.join(focus)}")
     if adv["avoid"]:
-        ev = "，".join(
-            f"{s}(历史{evidence_for(regime, s)})" for s in adv["avoid"] if s in strategy_names
-        )
-        if ev:
-            lines.append(f"  ⚠️ 今日回避（状态不匹配）：{ev}")
+        items = []
+        for s in adv["avoid"]:
+            if s not in strategy_names:
+                continue
+            ev = evidence_for(regime, s)
+            items.append(f"{s}(历史{ev})" if ev else s)
+        if items:
+            lines.append(f"  ⚠️ 今日回避（状态不匹配）：{'，'.join(items)}")
     return "\n".join(lines)
 
 

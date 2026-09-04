@@ -125,6 +125,8 @@ class PortfolioSim:
         exit_mode: str = "time",
         stop_loss: float = DEFAULT_STOP,
         chandelier_k: float = CHANDELIER_K,
+        use_risk_budget: bool = False,
+        states: pd.DataFrame | None = None,
     ) -> None:
         self.panel = panel
         self.events = events.sort_values(["date", "symbol"]).reset_index(drop=True)
@@ -138,6 +140,8 @@ class PortfolioSim:
         self.exit_mode = exit_mode
         self.stop_loss = stop_loss
         self.chandelier_k = chandelier_k
+        self.use_risk_budget = use_risk_budget
+        self._states = states if states is not None else pd.DataFrame()
 
         # 每股价格序列缓存 {symbol: df.set_index(date)}
         self._px: dict[str, pd.DataFrame] = {}
@@ -160,6 +164,7 @@ class PortfolioSim:
         self.positions: dict[str, dict] = {}      # symbol -> 持仓详情
         self.trades: list[dict] = []
         self.stats = {"entry_blocked": 0, "skipped_cap": 0, "skipped_cash": 0,
+                      "skipped_budget": 0,
                       "exit_extended": 0, "exit_still_blocked": 0,
                       "sell_failed_no_bar": 0}
 
@@ -202,6 +207,38 @@ class PortfolioSim:
             "hold_days": hold, "reason": reason, "force": force,
         })
 
+    # ── 风险预算（regime → 最大总仓位比例）──
+    # 源自 2y 分状态研究：up_low 顺风满仓 / up_high 情绪顶防御 / down_high 控仓抄底 / down_low 谨慎
+    RISK_BUDGET = {
+        "up_low": 1.0,
+        "up_high": 0.4,
+        "down_high": 0.6,
+        "down_low": 0.3,
+        "na": 0.5,  # 状态未知保守半仓
+    }
+
+    def _position_limit(self, d: pd.Timestamp) -> float:
+        """当日按市场状态允许的最大仓位金额。无 regime 数据则满仓。"""
+        if not self.use_risk_budget:
+            return float("inf")
+        regime = self._regime_on(d)
+        return self.capital * self.RISK_BUDGET.get(regime, 0.5)
+
+    def _regime_on(self, d: pd.Timestamp) -> str:
+        """日期 d 的市场状态（前向取最近，防未来函数）。"""
+        st = self._states.set_index("date")["regime"].sort_index()
+        idx = st.index.searchsorted(pd.Timestamp(d), side="right") - 1
+        return st.iloc[idx] if idx >= 0 else "na"
+
+    def _portfolio_value(self, d: pd.Timestamp) -> float:
+        """当日持仓市值（不含现金，用于仓位上限判断）。"""
+        mv = 0.0
+        for sym, pos in self.positions.items():
+            row = self._row(sym, d)
+            if row is not None:
+                mv += pos["shares"] * row["close"]
+        return mv
+
     # ── 买入（T+1 开盘执行）──
     def _try_buy(self, sym: str, d: pd.Timestamp) -> None:
         row = self._row(sym, d)
@@ -209,6 +246,10 @@ class PortfolioSim:
             return
         if row["open"] >= row["prev_close"] * row["lim_up"] * 0.995:
             self.stats["entry_blocked"] += 1  # 开盘一字/触涨停买不进
+            return
+        # 风险预算：持仓市值已达状态上限则停买
+        if self._portfolio_value(d) >= self._position_limit(d):
+            self.stats["skipped_budget"] += 1
             return
         if len(self.positions) >= self.max_pos:
             self.stats["skipped_cap"] += 1
@@ -349,6 +390,7 @@ def run_portfolio(
     by_quality: bool = False,
     combined: bool = False,
     regime_filter: bool = False,
+    risk_budget: bool = False,
     json_out: str | None = None,
 ) -> dict:
     settings = get_settings()
@@ -372,6 +414,12 @@ def run_portfolio(
         states = get_market_states(engine.db_path, refresh=True)
         events, dropped = apply_regime_filter(events, states)
         logger.info(f"regime 过滤: {dropped}")
+    # 风险预算需要市场状态序列
+    states_df = None
+    if risk_budget:
+        from sequoia_x.regime import get_market_states
+
+        states_df = get_market_states(engine.db_path, refresh=True)
     out: dict[str, dict] = {}
 
     if combined and events:
@@ -390,18 +438,20 @@ def run_portfolio(
             panel, merged, capital=capital, max_pos=max_pos, daily_k=daily_k,
             pos_size=pos_size, cost_bps=cost_bps, hold_days=hold_days,
             exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
+            use_risk_budget=risk_budget, states=states_df,
         )
         out["多策略联合"] = sim.run()
-        logger.info(f"多策略联合组合模拟完成（exit={exit_mode}, quality={by_quality}）")
+        logger.info(f"多策略联合组合模拟完成（exit={exit_mode}, quality={by_quality}, budget={risk_budget}）")
     else:
         for name, ev in events.items():
             sim = PortfolioSim(
                 panel, ev, capital=capital, max_pos=max_pos, daily_k=daily_k,
                 pos_size=pos_size, cost_bps=cost_bps, hold_days=hold_days,
                 exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
+                use_risk_budget=risk_budget, states=states_df,
             )
             out[name] = sim.run()
-            logger.info(f"{name} 组合模拟完成（exit={exit_mode} quality={by_quality}）")
+            logger.info(f"{name} 组合模拟完成（exit={exit_mode} quality={by_quality} budget={risk_budget}）")
     res = {
         "method": "portfolio-sim-p1",
         "note": (
@@ -432,8 +482,12 @@ def _print_res(res: dict) -> None:
               f"（赢 {s['avg_win']} / 亏 {s['avg_loss']}）| 均持 {s['avg_hold_days']} 日")
         print(f"  退出分布: {s['reason_dist']}")
         st = s["stats"]
+        budget_note = (
+            f" | 预算上限跳过 {st['skipped_budget']}" if st.get("skipped_budget", 0) else ""
+        )
         print(f"  统计: 入场涨停剔除 {st['entry_blocked']} | 满仓跳过 {st['skipped_cap']}"
-              f" | 现金不足 {st['skipped_cash']} | 卖出顺延 {st['exit_extended']} 仍封死 {st['exit_still_blocked']}")
+              f" | 现金不足 {st['skipped_cash']}{budget_note}"
+              f" | 卖出顺延 {st['exit_extended']} 仍封死 {st['exit_still_blocked']}")
 
 
 def main() -> None:
@@ -457,6 +511,8 @@ def main() -> None:
                         help="多策略联合组合（同一资金池）")
     parser.add_argument("--regime-filter", action="store_true",
                         help="按市场状态机过滤信号（avoid 状态剔除）")
+    parser.add_argument("--risk-budget", action="store_true",
+                        help="按市场状态缩放总仓位（up_low满仓/up_high 40%/down_high 60%/down_low 30%）")
     parser.add_argument("--json-out")
     args = parser.parse_args()
 
@@ -466,7 +522,7 @@ def main() -> None:
         pos_size=args.pos_size, cost_bps=args.cost_bps, hold_days=args.hold_days,
         stop_loss=args.stop_loss, chandelier_k=args.chandelier_k,
         by_quality=args.quality, combined=args.combined,
-        regime_filter=args.regime_filter,
+        regime_filter=args.regime_filter, risk_budget=args.risk_budget,
         json_out=args.json_out,
     )
     _print_res(res)

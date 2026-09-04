@@ -214,15 +214,50 @@ class ReportBuilder:
                 })
         cross.sort(key=lambda x: -x["cap_yi"])
 
+        # 市场状态（数据日当日的 regime，供日报状态机建议）
+        regime_info: dict = {}
+        try:
+            from sequoia_x.regime import get_market_states
+
+            states = get_market_states(self.engine.db_path, refresh=True)
+            if not states.empty:
+                # states.date 为 Timestamp；转 date 与 result_date(str) 比对 asof
+                st = states.copy()
+                st["d"] = st["date"].dt.date
+                # 数据日 result_date 是 str（YYYY-MM-DD），取 <= 它的最后一行
+                target = date.fromisoformat(result_date)
+                past = st[st["d"] <= target]
+                if not past.empty:
+                    last = past.iloc[-1]
+                    regime_info = {
+                        "regime": last["regime"],
+                        "date": str(last["d"]),
+                    }
+        except Exception as exc:
+            logger.warning(f"市场状态获取失败（跳过）: {exc}")
+
         return {
             "date": result_date,
             "generated_at": date.today().isoformat(),
             "strategies": strategies_out,
             "cross_hits": cross,
+            "regime": regime_info,
         }
 
     def to_markdown(self, result: dict) -> str:
         lines = [f"📈 Sequoia-X 选股日报 | 数据日 {result['date']}（收盘后）", ""]
+        # 市场状态区块（今日 regime → 主攻/回避）
+        if result.get("regime", {}).get("regime"):
+            try:
+                from sequoia_x.strategy_map import regime_markdown
+
+                strat_names = [s["name"] for s in result["strategies"]]
+                lines.append(
+                    regime_markdown(result["regime"]["regime"], strat_names)
+                )
+                lines.append("")
+            except Exception as exc:
+                logger.warning(f"regime 建议生成失败（跳过）: {exc}")
         for s in result["strategies"]:
             if not s["count_in_range"]:
                 lines.append(f"【{s['name']}】无（滤后 {s['count_total']} 只）")
