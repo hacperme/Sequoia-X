@@ -1,6 +1,7 @@
 #!/bin/bash
 # Sequoia-X 选股日报 wrapper：增量同步 + 生成报告 + 方案A跟踪，输出注入 cron agent
-# 用法: bash scripts/sequoia_report.sh   （仓库内维护；/opt/data/scripts/sequoia_report.sh 为软链）
+# 用法: bash scripts/sequoia_report.sh   （仓库内维护；cron 经 /opt/data/scripts/sequoia_report.sh
+#       真文件薄启动器 exec 本脚本——勿改成软链：cron runner realpath 校验拒链外解析，2026-09-04）
 # 返回 stdout 供 agent 解读；无新数据时输出 NO_TRADING_DAY
 # 环境变量:
 #   SEQUOIA_FORCE=1      跳过交易日检测（跨日强制用最近数据）
