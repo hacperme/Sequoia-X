@@ -93,7 +93,7 @@ python -c "from sequoia_x.core.config import get_settings; from sequoia_x.data.e
 
 - **cron `0fccfa4dd1f7`**：交易日北京 20:00（`0 12 * * 1-5` UTC，勿改盘前——数据日≠今日会误判非交易日）；deliver=origin（定时 tick 投递可靠，agent.log 有 `delivered ... via live adapter` 铁证）；script=`/opt/data/scripts/sequoia_report.sh`（sync容错 → 回测缓存刷新 → report → 摘要）
 - ⚠️ **/opt/data/scripts/sequoia_report.sh 必须是真文件**（薄启动器 `exec bash .../scripts/sequoia_report.sh`，主逻辑在仓库内维护）——2026-09-04 首日正式 tick 曾因该路径是**指向仓库的符号链接**被 cron runner realpath 校验拦截（`Blocked: script path resolves outside the scripts directory`），wrapper 完全没跑；force 版同坑排查
-- wrapper `/opt/data/scripts/sequoia_report.sh`：sync timeout 1800 容错(exit=124 降级) → backtest 1y 刷新缓存(失败沿用旧) → report → 摘要注入 agent；`SEQUOIA_FORCE=1` 跳过交易日检测（跨日验证）；防呆"滤后>0但区间内全0"→60s重试
+- wrapper `/opt/data/scripts/sequoia_report.sh`：sync timeout 3600 容错(exit=124 降级；2026-09-15 由 1800 上调——当日晚间 baostock 实测 0.56s/只≈48.5min，超时截杀致 engine 0 行落库，真交易日被误判 NO_TRADING_DAY) → backtest 1y 刷新缓存(失败沿用旧) → report → 摘要注入 agent；`SEQUOIA_FORCE=1` 跳过交易日检测（跨日验证）；防呆"滤后>0但区间内全0"→60s重试
 - ⚠️ wrapper 交易日检测 python 必须前缀 `TZ=Asia/Shanghai`（容器本地=UTC，naive now 按 UTC 恒判"未收盘"，sync 失败时会用旧数据日出报告而非 NO_TRADING_DAY；2026-09-04 790aa33 修复）
 - ⚠️ 手动 `cronjob run` **不投递**到 chat（走 delegation，自报 delivered 是假的）——验证投递用一次性定时 job 或等正式 tick
 - 僵尸 running 记录卡防重入：`UPDATE executions SET status='completed' WHERE status='running'`（/opt/data/cron/executions.db）
