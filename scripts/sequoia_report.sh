@@ -17,8 +17,10 @@ DATA_DIR="$PROJ/data"
 set -o pipefail
 
 # 1. 增量同步（单进程串行——baostock 并发触发风控 2026-09-04；全市场 5215 只
-#    实测 ~0.19s/只 ≈ 16 分钟，2026-09-04 实际 ~0.23s/只 ≈ 20 分钟，故超时给 1800s；
-#    cron 20:00 触发约 20:22 完成）
+#    实测 ~0.19s/只 ≈ 16 分钟，2026-09-04 实际 ~0.23s/只 ≈ 20 分钟；
+#    ⚠️ 2026-09-15 实测 0.56s/只 ≈ 48.5 分钟（晚间 baostock 明显变慢），
+#    原 1800s 超时被截杀 → engine 是"全部拉完才一次性落库"，超时=0 行写入，
+#    日报被误判 NO_TRADING_DAY（当日为真交易日）。故超时放宽到 3600s。
 #    注意：同步可能超时 —— 超时不算致命错误，继续尝试生成报告，
 #    数据日正确性由下方 NO_TRADING_DAY 逻辑把关。
 #    SEQUOIA_SKIP_SYNC=1 跳过同步（验证 tracker/report 链路或应急用）
@@ -26,7 +28,7 @@ SYNC_CODE=0
 if [ "$SEQUOIA_SKIP_SYNC" = "1" ]; then
     echo "（注：SEQUOIA_SKIP_SYNC=1 跳过增量同步）" >&2
 else
-    SYNC_OUT=$(cd "$PROJ" && timeout 1800 $VENV_PY main.py 2>&1)
+    SYNC_OUT=$(cd "$PROJ" && timeout 3600 $VENV_PY main.py 2>&1)
     SYNC_CODE=$?
     if [ $SYNC_CODE -ne 0 ] && [ $SYNC_CODE -ne 124 ]; then
         echo "SEQUOIA_ERROR: 同步失败 (exit=$SYNC_CODE)"
