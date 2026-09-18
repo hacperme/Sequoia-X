@@ -70,9 +70,9 @@ def _load_panel(db_path: str) -> pd.DataFrame:
 def compute_events(
     panel: pd.DataFrame,
     strategies: list[str] | None = None,
-    turtle_window: int = 20,
-    rps_period: int = 120,
-    rps_threshold: int = 90,
+    turtle_window: int | None = None,
+    rps_period: int | None = None,
+    rps_threshold: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     """对每个策略算出信号事件表 {strategy: DataFrame[symbol, date, seq]}。
 
@@ -80,21 +80,30 @@ def compute_events(
     （权威向量化实现），不再复制粘贴信号条件（原双实现导致 RPS shift(1)
     不一致、高窄旗形缺高位抗跌等漂移）。panel 需由 _load_panel 准备
     （含 prev_close/lim_up/lim_dn）。
+
+    ⚠️ 参数默认值单一来源（2026-09-17 修）：turtle_window / rps_period /
+       rps_threshold 默认均为 None = **沿用各策略类自身的默认属性**，仅在显式
+       传参时才覆盖（网格 _run_grid 仍显式传值）。此前本函数与 run_backtest、
+       argparse 各自硬编码 90/20 三份副本，且本函数会 setattr 覆盖类属性 ——
+       改策略类默认值对回测/组合**不生效**（2026-09-17 A/B 实测踩坑：注入类属性
+       后 90 与 95 结果完全相同才发现）。
     """
     from sequoia_x.strategy import STRATEGY_REGISTRY
 
     # 策略名 → (类, 参数覆盖)，源自中央注册表（仅 backtest=True 参与）。
-    # 窗口/阈值参数化供网格 _run_grid 用。
     registry: dict[str, tuple[type, dict]] = {
         spec.cn_name: (spec.cls, {}) for spec in STRATEGY_REGISTRY if spec.backtest
     }
-    if "海龟突破" in registry:
+    # 仅显式传参才覆盖；None 则沿用类默认（单一来源）
+    if turtle_window is not None and "海龟突破" in registry:
         registry["海龟突破"] = (registry["海龟突破"][0], {"breakout_window": turtle_window})
     if "RPS 突破" in registry:
-        registry["RPS 突破"] = (
-            registry["RPS 突破"][0],
-            {"rps_period": rps_period, "rps_threshold": rps_threshold},
-        )
+        params: dict = {}
+        if rps_period is not None:
+            params["rps_period"] = rps_period
+        if rps_threshold is not None:
+            params["rps_threshold"] = rps_threshold
+        registry["RPS 突破"] = (registry["RPS 突破"][0], params)
 
     def mask_to_events(mask: pd.Series) -> pd.DataFrame:
         return panel.loc[mask, ["symbol", "date", "seq"]].reset_index(drop=True)
@@ -378,8 +387,8 @@ def run_backtest(
     period: str = "1y",
     json_out: str | None = None,
     cost_bps: int = DEFAULT_COST_BPS,
-    turtle_window: int = 20,
-    rps_threshold: int = 90,
+    turtle_window: int | None = None,
+    rps_threshold: int | None = None,
     with_portfolio: bool = True,
     fetch_index: bool = True,
 ) -> dict:
@@ -494,8 +503,10 @@ def main() -> None:
     parser.add_argument("--json-out", help="结果写 JSON")
     parser.add_argument("--cost-bps", type=int, default=DEFAULT_COST_BPS,
                         help="双边合计成本基点（默认 25 = 0.25%）")
-    parser.add_argument("--turtle-window", type=int, default=20, help="海龟突破通道窗口")
-    parser.add_argument("--rps-threshold", type=int, default=90, help="RPS 分位阈值")
+    parser.add_argument("--turtle-window", type=int, default=None,
+                        help="海龟突破通道窗口（缺省=策略类默认 20）")
+    parser.add_argument("--rps-threshold", type=int, default=None,
+                        help="RPS 分位阈值（缺省=策略类默认 95，2026-09-17 起）")
     parser.add_argument("--no-portfolio", action="store_true", help="跳过组合层")
     parser.add_argument("--no-index", action="store_true", help="跳过沪深300 超额对比")
     parser.add_argument("--grid", action="store_true", help="参数网格模式")

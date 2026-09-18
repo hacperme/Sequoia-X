@@ -11,7 +11,12 @@ class RpsBreakoutStrategy(BaseStrategy):
 
     webhook_key: str = "rps"
     rps_period: int = 120
-    rps_threshold: int = 90
+    # 分位阈值：2026-09-17 由 90 上调至 95（1Y+2Y 组合层 A/B 双期同向验证：
+    # 1y 净收益 -16.3%→-0.6%、回撤 -21.2%→-9.7%、胜率 33.2%→42.2%；
+    # 2y -7.5%→+0.4%、回撤 -19.5%→-10.9%）。
+    # ⚠️ 本属性是**唯一权威默认值**——backtest.compute_events 的 rps_threshold
+    #    默认已改 None，未显式传参时沿用本值（避免默认值多处重复漂移）。
+    rps_threshold: int = 95
 
     def run(self) -> list[str]:
         try:
@@ -59,7 +64,7 @@ class RpsBreakoutStrategy(BaseStrategy):
         """权威向量化信号（与 run() 同口径）：120 日涨幅横截面 rank≥阈值 ∧ 收盘≥前120日高×0.9。
 
         注意：横截面指标，需全市场同日数据。roll_high 用 shift(1) 防未来函数。
-        参数：self.rps_period（默认 120）/ self.rps_threshold（默认 90）。
+        参数：self.rps_period（默认 120）/ self.rps_threshold（默认 95，2026-09-17 起）。
         """
         g = panel.groupby("symbol", sort=False)
         chg = g["close"].transform(
