@@ -287,9 +287,143 @@ def track(state: dict) -> None:
         _save_state(state)
 
 
+# ---------- 离场提示（2026-09-18 新增） ----------
+# 依据 1Y 组合层 A/B（RPS95，同参数只换出场模式）：
+#   hold=10 + 吊灯  净 +2.2% / 回撤 -7.2% / 胜率 44.1%   ← 采用
+#   hold=20 + 吊灯  净 -0.6% / 回撤 -9.7% / 胜率 42.2%
+#   固定止损 -8%    净 +0.2% / 回撤 -8.8% / 胜率 29.8%   ← 不用：65% 仓位被震出
+# 故到期取 10 交易日 + 吊灯止损(3×ATR14) 辅助。详见仓库 SKILL.md 第 6 节。
+EXIT_HOLD_DAYS = 10
+EXIT_CHANDELIER_K = 3.0
+NAMES_PATH = os.path.join(os.path.dirname(DB_PATH), "stock_names.json")
+NAMES_TTL_DAYS = 7
+
+
+def _load_names(ttl_days: int = NAMES_TTL_DAYS) -> dict[str, str]:
+    """代码→名称缓存（baostock query_stock_basic 全量，默认 7 天 TTL）。
+
+    库内 stock_daily 不存名称，而名称每次都要联网拉全量（~8800 只），故落盘缓存：
+    TTL 内直接读盘；刷新失败退回旧缓存（哪怕已过期）；无缓存返回空 dict（名称显示空）。
+    """
+    cached: dict[str, str] = {}
+    fetched: str | None = None
+    if os.path.exists(NAMES_PATH):
+        try:
+            with open(NAMES_PATH, encoding="utf-8") as f:
+                obj = json.load(f)
+            cached = obj.get("names") or {}
+            fetched = obj.get("fetched_at")
+        except Exception:
+            cached, fetched = {}, None
+    if cached and fetched:
+        try:
+            if (datetime.now() - datetime.fromisoformat(fetched)).days < ttl_days:
+                return cached
+        except Exception:
+            pass
+    try:
+        import baostock as bs
+        lg = bs.login()
+        if lg.error_code != "0":
+            raise RuntimeError(lg.error_msg)
+        names: dict[str, str] = {}
+        try:
+            rs = bs.query_stock_basic(code_name="", code="")
+            while rs.next():
+                row = rs.get_row_data()
+                names[row[0].split(".")[1]] = row[1]
+        finally:
+            bs.logout()
+        if names:
+            with open(NAMES_PATH, "w", encoding="utf-8") as f:
+                json.dump({"fetched_at": datetime.now().isoformat(timespec="seconds"),
+                           "names": names}, f, ensure_ascii=False)
+            return names
+    except Exception as exc:
+        print(f"[names] 名称刷新失败，沿用缓存 {len(cached)} 条: {exc}")
+    return cached
+
+
+def _atr14(symbol: str, asof: str) -> float | None:
+    """ATR(14)：最近 14 根真实波幅均值（与 portfolio._add_atr 同口径）。"""
+    with _conn() as c:
+        df = pd.read_sql_query(
+            "SELECT date, high, low, close FROM stock_daily WHERE symbol=? AND date<=? "
+            "ORDER BY date DESC LIMIT 15", c, params=(symbol, asof))
+    if len(df) < 2:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+    pc = df["close"].shift(1)
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(),
+                    (df["low"] - pc).abs()], axis=1).max(axis=1)
+    v = tr.tail(14).mean()
+    return float(v) if pd.notna(v) else None
+
+
+def _shift_trade_days(dates: list[str], after: str, n: int) -> str | None:
+    """把 after 本身算作第 1 个交易日，取第 n 个交易日（用于预告到期日）。"""
+    later = [d for d in dates if d >= after]
+    return later[n - 1] if len(later) >= n else None
+
+
+def exit_signals(state: dict) -> list[dict]:
+    """对已买入批次的所有持仓（按个股合并）算离场条件，返回按浮亏升序的清单。
+
+    触发：① 到期——持有满 EXIT_HOLD_DAYS 个交易日；② 吊灯止损——收盘 < 峰值−K×ATR14。
+    ⚠️ 只为持仓提供"该走了"提醒，不构成实盘持仓宣称：方案 A 是模拟盘（每批独立
+    100 万名义本金、100 股整手），与用户真实持仓无关，需自行对照。
+    """
+    dates = _trading_dates()
+    latest = dates[-1]
+    agg: dict[str, dict] = {}
+    for b in state["batches"]:
+        if b["status"] != "bought":
+            continue
+        for e in b["entries"]:
+            a = agg.setdefault(e["code"], {"qty": 0.0, "cost": 0.0,
+                                           "first": e["date"], "n": 0})
+            a["qty"] += e["qty"]
+            a["cost"] += e["qty"] * e["price"]
+            a["first"] = min(a["first"], e["date"])
+            a["n"] += 1
+    rows: list[dict] = []
+    for code, a in agg.items():
+        if a["qty"] <= 0:
+            continue
+        ep = a["cost"] / a["qty"]
+        with _conn() as c:
+            df = pd.read_sql_query(
+                "SELECT date, close FROM stock_daily WHERE symbol=? AND date>=? AND date<=? "
+                "ORDER BY date", c, params=(code, a["first"], latest))
+        if df.empty:
+            continue
+        cur = float(df["close"].iloc[-1])
+        peak = float(df["close"].max())
+        bars = len([d for d in dates if a["first"] <= d <= latest])
+        atr = _atr14(code, latest)
+        trail = (peak - EXIT_CHANDELIER_K * atr) if atr else None
+        trig: list[str] = []
+        if bars >= EXIT_HOLD_DAYS:
+            trig.append("time")
+        if trail is not None and cur <= trail:
+            trig.append("chandelier")
+        rows.append({
+            "code": code, "n_batches": a["n"], "qty": a["qty"], "first_date": a["first"],
+            "entry_px": round(ep, 2), "close": round(cur, 2), "peak": round(peak, 2),
+            "atr14": round(atr, 3) if atr else None,
+            "trail": round(trail, 2) if trail is not None else None,
+            "bars": bars, "ret_pct": round((cur / ep - 1) * 100, 2),
+            "due_date": _shift_trade_days(dates, a["first"], EXIT_HOLD_DAYS),
+            "triggers": trig,
+        })
+    rows.sort(key=lambda r: r["ret_pct"])
+    return rows
+
+
 # ---------- 报告 ----------
 
-def report(state: dict) -> str:
+def report(state: dict, exit_rows: list[dict] | None = None,
+           names: dict[str, str] | None = None) -> str:
     out = []
     out.append("=" * 62)
     out.append("📡 方案 A：日报名单前瞻跟踪（akquant 独立引擎）")
@@ -324,6 +458,46 @@ def report(state: dict) -> str:
             out.append(f"  T+5 {ret_at(5)} ｜ T+10 {ret_at(10)} ｜ T+20 {ret_at(20)}")
         elif b["status"] == "bought":
             out.append(f"\n▸ {sig} [{reg}] 已买入但无跟踪数据（状态异常）")
+    # ---- 离场提示段（2026-09-18 新增）----
+    if exit_rows is not None:
+        ex = [r for r in exit_rows if r["triggers"]]
+        hold = [r for r in exit_rows if not r["triggers"]]
+        n_time = sum(1 for r in ex if "time" in r["triggers"])
+        n_ch = sum(1 for r in ex if "chandelier" in r["triggers"])
+        out.append("")
+        out.append("🚪 离场提示（模拟持仓，非实盘；请自行对照）")
+        out.append(f"  持仓 {len(exit_rows)} 只（按个股合并）｜建议离场 {len(ex)} 只"
+                   f"（到期 {n_time}｜吊灯 {n_ch}）")
+        out.append(f"  口径：持有满 {EXIT_HOLD_DAYS} 交易日 或 收盘 < 峰值−"
+                   f"{EXIT_CHANDELIER_K:g}×ATR14")
+        if ex:
+            for r in ex:
+                nm = (names or {}).get(r["code"], "")
+                tags = []
+                if "time" in r["triggers"]:
+                    tags.append("到期%d日" % EXIT_HOLD_DAYS)
+                if "chandelier" in r["triggers"]:
+                    tags.append("吊灯止损")
+                due = f" 到期日{r['due_date']}" if (r["due_date"] and "time" in r["triggers"]) else ""
+                out.append(f"  {r['code']} {nm:<7s} {r['ret_pct']:+7.2f}%  持{r['bars']:>2}日"
+                           f"{due}  {'+'.join(tags)}")
+        else:
+            out.append("  （无）")
+        if hold:
+            worst = "｜".join(
+                f"{r['code']}{(names or {}).get(r['code'], '')} {r['ret_pct']:+.2f}%"
+                for r in hold[:3])
+            out.append(f"  ⏸ 继续持有 {len(hold)} 只，浮亏最大: {worst}")
+            # 即将到期预告（2026-09-18）：同批买入的持仓会在同一天集中到期，
+            # 提前列出便于分散卖出 —— 实测「批内错峰持有期」无可靠收益效应
+            # （见 SKILL.md 第 6 节），故不自动错峰，只做预告交人工安排。
+            # 注：未来交易日无行情数据、算不出具体日期，故用"还需 N 日"表述。
+            soon = [r for r in hold if 1 <= EXIT_HOLD_DAYS - r["bars"] <= 2]
+            if soon:
+                soon_txt = "｜".join(
+                    f"{r['code']}{(names or {}).get(r['code'], '')}还需{EXIT_HOLD_DAYS - r['bars']}日"
+                    for r in sorted(soon, key=lambda x: x["bars"], reverse=True))
+                out.append(f"  ⏳ 即将到期 {len(soon)} 只: {soon_txt}")
     out.append(f"\n批次总计 {len(state['batches'])}，跟踪中 {active}")
     return "\n".join(out)
 
@@ -334,7 +508,7 @@ def update(report_path: str, quiet: bool = False) -> str:
     register(state, report_path)
     fill_pending(state, dates)
     track(state)
-    r = report(state)
+    r = report(state, exit_rows=exit_signals(state), names=_load_names())
     if not quiet:
         print(r)
     return r
@@ -350,7 +524,7 @@ def main() -> None:
         update(os.path.abspath(report_path))
     else:
         state = _load_state()
-        print(report(state))
+        print(report(state, exit_rows=exit_signals(state), names=_load_names()))
 
 
 if __name__ == "__main__":

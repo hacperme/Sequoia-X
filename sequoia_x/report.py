@@ -256,6 +256,12 @@ class ReportBuilder:
             lines.append("⭐ 多策略共振：")
             for c in result["cross_hits"]:
                 lines.append(f"  {c['code']} {c['name']} 市值{c['cap_yi']:.0f}亿（{' + '.join(c['strategies'])}）")
+            # 入场跳空提醒（2026-09-18 验证加入）。跳空只有次日开盘才知道，日报在
+            # 收盘后生成、无法预过滤，故只作可执行提示：次日开盘若高开 ≥5%（相对
+            # 前收）直接放弃。依据 1Y/2Y 事件研究，该组均为负期望（1Y −3.58%/n=56、
+            # 2Y −1.79%/n=212，胜率 38~39%），但只占信号 4.9%，全样本仅改善
+            # 0.05~0.38pp，故**不做硬过滤**（详见 SKILL.md 第 6 节）。
+            lines.append("  ⚠️ 次日开盘若高开 ≥5%，历史该组负期望（1Y −3.6%/2Y −1.8%），建议放弃该标的")
         # 回测参考（若有）
         if result.get("backtest"):
             bt = result["backtest"]
