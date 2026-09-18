@@ -233,6 +233,6 @@ RPS 短周期特性明确（10 日持有 → 收益 +2.8pp、回撤 -2.5pp、胜
 - 开发在 **dev 分支**（fork hacperme/Sequoia-X，跟踪 origin/dev）；commit 本地 → 用户确认后 push
 - 只 `git add` 功能文件（sequoia_x/*、main.py）；辅助脚本(data/*.json、*.py 工具)与 data/ 不入库
 - git 身份：hacper / **git@hacperme.com**（2026-09-04 起，全局+仓库级）
-- 每个功能"实现+测试验证"通过才提交；测试先行（策略改动跑 run_local_test.py；回测改动跑冒烟）
+- 每个功能"实现+测试验证"通过才提交；测试先行（**`pytest tests/` 15 项**；全策略冒烟跑 `python -m sequoia_x.report --markdown`）
 - 提交信息中文要点式，标注实测结论与踩坑
 - **同步更新本 SKILL.md**（本文档与代码同版本演进；新增功能/新研究结论/新坑必记）
