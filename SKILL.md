@@ -218,9 +218,60 @@ RPS 短周期特性明确（10 日持有 → 收益 +2.8pp、回撤 -2.5pp、胜
 - CLI `report` 与 `update` 两条路径都要传 `exit_rows`/`names`（首版漏了 CLI 分支，实测发现离场段不显示）
 
 
+### 6.4 ⚠️ 交付链路自检（2026-09-20）：功能"上线"≠送达
+
+对 14 个交易日 cron 输出做体检，发现两个真问题 + 一个预期报错被误报。**教训：改完脚本必须验证"用户实际收到了什么"，不能只看本地能跑。**
+
+**① 离场提示从未送达（P0，双重缺口）**
+
+`exit_signals` 实现、本地验证、推送都做了，但翻遍 cron 输出正文 `离场` 出现 **0 次**。两处独立缺口叠加：
+
+- **prompt 缺口**：cron 任务 prompt 的 6 步报告结构里**没有「离场」这一步** → 即使 script 输出有清单，agent 也不会写进日报
+- **触发缺口**：2026-09-18 那次 wrapper 短路（见 ②），**tracker 步骤根本没跑**（铁证：`track_state.json` mtime 停在当日 04:11，而日报是 13:39）
+
+修复：① wrapper 第 7 步**把离场清单直接注入结构化摘要**（不再只依赖 tracker 长输出段）；② cron prompt 新增第 6 步「🚪 离场提示（必带小节）」。
+
+**② `NO_TRADING_DAY` 把"数据未发布"误判为"非交易日"（P1）**
+
+2026-09-18 实况：20:00 触发 → `main.py` 晚间慢跑约 48 分钟 → 20:49 同步完仍只有 09-17 数据（baostock 当日 K 到 **~21:00** 才发布）→ 守卫判 `NO_TRADING_DAY` → **整条流水线短路**（backtest/report/tracker 全跳过）→ 靠 cron agent 临场复查、21:02 重新同步才补上（日报晚 1h40m，且漏 tracker）。
+
+根因：守卫只比「库内最新数据日」与「日历最近已收盘日」，**无法区分真休市与数据延迟**；且旧日历回退只跳周末、不识别节假日。
+
+修复（`sequoia_x/trading_calendar.py` 新增 + wrapper 重构）：
+
+- 用 baostock 权威日历 `query_trade_dates` 判「是否交易日」（节假日也算得准），失败才回退旧周末推算
+- 日历检查**提到同步之前** —— 避免数据未发布时白跑 48 分钟全市场同步
+- 交易日且数据未发布 → 探针轮询等待（`query_history_k_data_plus` 查 `sh.600000` 等 4 只样本的当日收盘价，`SEQUOIA_PROBE_WAIT=600` × `SEQUOIA_PROBE_MAX=8` 最多 80 分钟）→ 仍无 → **新标志 `DATA_NOT_READY`**（明确告知不是非交易日）
+- 同步后二次校验兜底：数据日仍未达 → `DATA_NOT_READY`
+- 非交易日：数据已是最新交易日才 `NO_TRADING_DAY`；数据落后则继续**补跑**（避免非交易日一律短路丢失自愈机会）；手动重跑同日报告用 `SEQUOIA_FORCE=1`
+- 超时预算：最坏路径 = 80(探针等待) + 60(同步) + 20(回测/报告/跟踪) ≈ **160 分钟** → `cron.script_timeout_seconds` 由 7200 提到 **10800**（0.19s/只→0.56s/只 的晚间波动也要留量）
+
+**③ 仓库自带飞书推送的 `[19001]` 是预期行为（P2）**
+
+`.env` 的 `FEISHU_WEBHOOK_URL` 是占位值 → `main.py` 推送必报 `webhook access token invalid`。这是设计如此（投递走 Hermes 通道），但 2026-09-18 的 agent 把它当异常写进了日报末尾。已在 cron prompt 加「不要报告的事」段明确禁止。⚠️ **占位值不得外泄、不得换成真实 token**。
+
+**④ 观察：状态机建议与正期望策略分歧**
+
+`regime=down_low` 建议回避「海龟突破、RPS 突破」，但回测里 **RPS 是唯一正期望策略**（10 日 +2.09%）。建议方向与数据方向相反，日报里保留这个分歧提示供人工判断。
+
+**自查清单（改脚本后必跑）**：
+
+```bash
+# ① 标志分支：改 wrapper 后至少验证「非交易日」与「数据未就绪」两条短路路径
+bash scripts/sequoia_report.sh                      # 周末应秒出 NO_TRADING_DAY
+python -m sequoia_x.trading_calendar --recent-closed  # 日历可用性
+python -m sequoia_x.trading_calendar --probe 2026-09-18  # 探针（应 PUBLISHED=1）
+# ② 摘要注入：确认离场段真的进了最终输出（不是只在 tracker 长段里）
+SEQUOIA_FORCE=1 SEQUOIA_SKIP_SYNC=1 bash scripts/sequoia_report.sh | tail -30
+# ③ 送达验证：次日翻 cron 输出文件，确认新段真的出现（本项就是漏掉才出的事）
+grep -c 离场 /opt/data/cron/output/<job_id>/<最新>.md
+```
+
 ## 7. 运维
 
-- **cron `0fccfa4dd1f7`**：交易日北京 20:00（`0 12 * * 1-5` UTC，勿改盘前——数据日≠今日会误判非交易日）；deliver=origin（定时 tick 投递可靠，agent.log 有 `delivered ... via live adapter` 铁证）；script=`/opt/data/scripts/sequoia_report.sh`（sync容错 → 回测缓存刷新 → report → 摘要）
+- **cron `0fccfa4dd1f7`**：交易日北京 20:00（`0 12 * * 1-5` UTC，勿改盘前——数据日≠今日会判数据未就绪）；deliver=origin（定时 tick 投递可靠，agent.log 有 `delivered ... via live adapter` 铁证）；script=`/opt/data/scripts/sequoia_report.sh`（日历/数据就绪 → sync容错 → 回测缓存刷新 → report → tracker → 摘要含离场）
+- **`cron.script_timeout_seconds = 10800`**（2026-09-20 由 7200 提高）：最坏路径含 80 分钟探针等待 + 60 分钟同步 ≈ 160 分钟。⚠️ 实时读取，改后无需重启 gateway
+- **wrapper 标志分支**：`NO_TRADING_DAY`（日历判定真休市）｜`DATA_NOT_READY`（交易日但 baostock 数据未发布 —— **不是非交易日**）｜`SEQUOIA_ERROR`。cron prompt 已按三者分别指示
 - ⚠️ **/opt/data/scripts/sequoia_report.sh 必须是真文件**（薄启动器 `exec bash .../scripts/sequoia_report.sh`，主逻辑在仓库内维护）——2026-09-04 首日正式 tick 曾因该路径是**指向仓库的符号链接**被 cron runner realpath 校验拦截（`Blocked: script path resolves outside the scripts directory`），wrapper 完全没跑；force 版同坑排查
 - wrapper `/opt/data/scripts/sequoia_report.sh`：sync timeout 3600 容错(exit=124 降级；2026-09-15 由 1800 上调——当日晚间 baostock 实测 0.56s/只≈48.5min，超时截杀致 engine 0 行落库，真交易日被误判 NO_TRADING_DAY) → backtest 1y 刷新缓存(失败沿用旧) → report → 摘要注入 agent；`SEQUOIA_FORCE=1` 跳过交易日检测（跨日验证）；防呆"滤后>0但区间内全0"→60s重试
 - ⚠️ wrapper 交易日检测 python 必须前缀 `TZ=Asia/Shanghai`（容器本地=UTC，naive now 按 UTC 恒判"未收盘"，sync 失败时会用旧数据日出报告而非 NO_TRADING_DAY；2026-09-04 790aa33 修复）
