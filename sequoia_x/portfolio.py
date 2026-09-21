@@ -168,7 +168,7 @@ class PortfolioSim:
         self.trades: list[dict] = []
         self._row_cache: dict[tuple, pd.Series | None] = {}  # P1a: 当日 bar 缓存
         self.stats = {"entry_blocked": 0, "skipped_cap": 0, "skipped_cash": 0,
-                      "skipped_budget": 0,
+                      "skipped_budget": 0, "skipped_held": 0,
                       "exit_extended": 0, "exit_still_blocked": 0,
                       "sell_failed_no_bar": 0}
 
@@ -262,6 +262,12 @@ class PortfolioSim:
         # 风险预算：持仓市值已达状态上限则停买
         if self._portfolio_value(d) >= self._position_limit(d):
             self.stats["skipped_budget"] += 1
+            return
+        # 已持有该股则不再建仓（防覆盖旧仓造成资金泄漏：
+        # hold_days 超过信号冷却期(20 交易日)时同股二次信号会命中旧仓，
+        # 旧仓 shares/cost 被直接替换 → 成本凭空消失、trades 少记一笔）
+        if sym in self.positions:
+            self.stats["skipped_held"] += 1
             return
         if len(self.positions) >= self.max_pos:
             self.stats["skipped_cap"] += 1
