@@ -40,6 +40,7 @@ from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.backtest import _load_panel, _fetch_index, compute_events
 from sequoia_x.strategy import DEFAULT_HOLD_DAYS, hold_days_for
+from sequoia_x.strategy_map import TRAIL_OFF_REGIMES, trail_enabled
 
 logger = get_logger(__name__)
 
@@ -79,7 +80,8 @@ def _add_features(panel: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
-def _score_events(panel: pd.DataFrame, events: pd.DataFrame, name: str) -> pd.DataFrame:
+def _score_events(panel: pd.DataFrame, events: pd.DataFrame, name: str,
+                  liq_penalty: float = 0.0) -> pd.DataFrame:
     """给事件附横截面质量分（当日全部信号内 rank 均值，越大越优先入场）。
 
     策略各自的"信号质量"直觉（P1 研究用，参数非定论）：
@@ -87,10 +89,15 @@ def _score_events(panel: pd.DataFrame, events: pd.DataFrame, name: str) -> pd.Da
     - 海龟突破：突破幅度越小（刚突破）越新鲜，幅度大=已透支（rank -幅度）
     - 均线放量：放量倍数越大动能越强（rank volume/vol_ma20）
     其余策略无明确排序 → score 恒 0（随机先到先得，与 P0 一致）。
+
+    liq_penalty>0 时叠加**大成交额惩罚**（2026-09-17 流动性分层发现的可落地形态）：
+    当日信号内按真实成交额(turnover) 的百分位扣分——成交额越大扣越多（低额段历史更好，
+    海龟 51%/均线 48% 的信号落在最差 Q4）。⚠️ 只做**排序倾斜**，不做硬过滤（低成交额实盘
+    滑点大、且涨停洗盘天然集中在大成交额股）。
     """
     ev = events.copy()
     need = ["symbol", "date", "hi40", "lo40", "hi10", "lo10", "vol_ma20",
-            "volume", "high20_prev", "close"]
+            "volume", "high20_prev", "close", "turnover"]
     cols = ev[["symbol", "date"]].merge(
         panel[need], on=["symbol", "date"], how="left"
     )
@@ -109,6 +116,9 @@ def _score_events(panel: pd.DataFrame, events: pd.DataFrame, name: str) -> pd.Da
         score = m.groupby(cols["date"]).rank(pct=True) * 100
     else:
         score = pd.Series(0.0, index=ev.index)
+    if liq_penalty:
+        liq_pct = cols["turnover"].groupby(cols["date"]).rank(pct=True)  # 1=当日成交额最大
+        score = score - liq_penalty * liq_pct.fillna(0.5).values
     ev["score"] = score.fillna(0.0).values
     return ev
 
@@ -131,6 +141,7 @@ class PortfolioSim:
         chandelier_k: float = CHANDELIER_K,
         use_risk_budget: bool = False,
         states: pd.DataFrame | None = None,
+        trail_off_regimes: tuple[str, ...] | None = None,
     ) -> None:
         self.panel = panel
         self.events = events.sort_values(["date", "symbol"]).reset_index(drop=True)
@@ -146,6 +157,8 @@ class PortfolioSim:
         self.chandelier_k = chandelier_k
         self.use_risk_budget = use_risk_budget
         self._states = states if states is not None else pd.DataFrame()
+        # 移动止损按状态启停：None = 用单一声明 TRAIL_OFF_REGIMES；() = 全状态都启用（关闭该策略）
+        self.trail_off_regimes = tuple(TRAIL_OFF_REGIMES if trail_off_regimes is None else trail_off_regimes)
 
         # 每股价格序列缓存 {symbol: df.set_index(date)}
         self._px: dict[str, pd.DataFrame] = {}
@@ -168,7 +181,7 @@ class PortfolioSim:
         self.positions: dict[str, dict] = {}      # symbol -> 持仓详情
         self.trades: list[dict] = []
         self._row_cache: dict[tuple, pd.Series | None] = {}  # P1a: 当日 bar 缓存
-        self.stats = {"entry_blocked": 0, "skipped_cap": 0, "skipped_cash": 0,
+        self.stats = {"entry_blocked": 0, "skipped_cap": 0, "skipped_cash": 0, "trail_suppressed": 0,
                       "skipped_budget": 0, "skipped_held": 0,
                       "exit_extended": 0, "exit_still_blocked": 0,
                       "sell_failed_no_bar": 0}
@@ -238,7 +251,13 @@ class PortfolioSim:
         return self.capital * self.RISK_BUDGET.get(regime, 0.5)
 
     def _regime_on(self, d: pd.Timestamp) -> str:
-        """日期 d 的市场状态（前向取最近，防未来函数）。"""
+        """日期 d 的市场状态（前向取最近，防未来函数）。
+
+        ⚠️ 无状态表（未传 states / 空表 / 缺列）时返回 "na" —— 上游据此保守处理
+        （移动止损害启用），勿直接 set_index 否则 KeyError。
+        """
+        if self._states is None or self._states.empty or "date" not in self._states.columns:
+            return "na"
         st = self._states.set_index("date")["regime"].sort_index()
         idx = st.index.searchsorted(pd.Timestamp(d), side="right") - 1
         return st.iloc[idx] if idx >= 0 else "na"
@@ -307,19 +326,28 @@ class PortfolioSim:
                 continue
             pos["bars_held"] += 1
             pos["peak"] = max(pos["peak"], row["close"])
-            reason = self._check_exit(pos, row)
+            reason = self._check_exit(pos, row, d)
             if reason:
                 pos["sell_pending_since"] = d
                 pos["sell_reason"] = reason
 
-    def _check_exit(self, pos: dict, row: pd.Series) -> str | None:
+    def _check_exit(self, pos: dict, row: pd.Series,
+                    d: pd.Timestamp | None = None) -> str | None:
+        """出场判定。d 非空时按当日市场状态决定移动止损是否启用（TRAIL_OFF_REGIMES）。
+
+        ⚠️ trail 关闭时**仅关闭止损/吊灯**，时间上限照旧生效（时钟上限不可取消，见 SKILL）。
+        """
         close = row["close"]
-        if self.exit_mode in ("stop", "chandelier") and close <= 0:
+        trail_on = trail_enabled(self._regime_on(d) if d is not None else None,
+                                 self.trail_off_regimes)
+        if not trail_on and self.exit_mode in ("stop", "chandelier"):
+            self.stats["trail_suppressed"] += 1
+        if self.exit_mode in ("stop", "chandelier") and trail_on and close <= 0:
             return None
-        if self.exit_mode == "stop":
+        if self.exit_mode == "stop" and trail_on:
             if close <= pos["entry_px"] * (1 - self.stop_loss):
                 return f"stop-{int(self.stop_loss*100)}%"
-        elif self.exit_mode == "chandelier":
+        elif self.exit_mode == "chandelier" and trail_on:
             atr = row.get("atr")
             if atr and not np.isnan(atr):
                 trail = pos["peak"] - self.chandelier_k * atr
@@ -408,9 +436,11 @@ def run_portfolio(
     stop_loss: float = DEFAULT_STOP,
     chandelier_k: float = CHANDELIER_K,
     by_quality: bool = False,
+    liq_penalty: float = 0.0,
     combined: bool = False,
     regime_filter: bool = False,
     risk_budget: bool = False,
+    trail_off_regimes: tuple[str, ...] | None = None,
     json_out: str | None = None,
 ) -> dict:
     settings = get_settings()
@@ -426,7 +456,8 @@ def run_portfolio(
 
     events = compute_events(panel, strategies=strategies)
     if by_quality:
-        events = {n: _score_events(panel, ev, n) for n, ev in events.items()}
+        events = {n: _score_events(panel, ev, n, liq_penalty=liq_penalty)
+                  for n, ev in events.items()}
     if regime_filter:
         from sequoia_x.regime import get_market_states
         from sequoia_x.strategy_map import apply_regime_filter
@@ -434,9 +465,10 @@ def run_portfolio(
         states = get_market_states(engine.db_path, refresh=True)
         events, dropped = apply_regime_filter(events, states)
         logger.info(f"regime 过滤: {dropped}")
-    # 风险预算需要市场状态序列
+    # 风险预算 / 移动止损启停 都需要市场状态序列
+    trail_off = tuple(TRAIL_OFF_REGIMES if trail_off_regimes is None else trail_off_regimes)
     states_df = None
-    if risk_budget:
+    if risk_budget or trail_off:
         from sequoia_x.regime import get_market_states
 
         states_df = get_market_states(engine.db_path, refresh=True)
@@ -464,6 +496,7 @@ def run_portfolio(
             pos_size=pos_size, cost_bps=cost_bps, hold_days=h_combined,
             exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
             use_risk_budget=risk_budget, states=states_df,
+            trail_off_regimes=trail_off,
         )
         out["多策略联合"] = sim.run()
         logger.info(f"多策略联合组合模拟完成（exit={exit_mode}, quality={by_quality}, budget={risk_budget}）")
@@ -476,6 +509,7 @@ def run_portfolio(
                 pos_size=pos_size, cost_bps=cost_bps, hold_days=h,
                 exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
                 use_risk_budget=risk_budget, states=states_df,
+                trail_off_regimes=trail_off,
             )
             out[name] = sim.run()
             logger.info(f"{name} 组合模拟完成（exit={exit_mode} quality={by_quality} budget={risk_budget}）")
@@ -491,7 +525,9 @@ def run_portfolio(
         "note": (
             f"收盘决策次日开盘成交；exit={exit_mode}；max_pos={max_pos} daily_k={daily_k} "
             f"pos_size={pos_size} {hold_txt} 成本{cost_bps}bp；一手100股；"
+            f"移动止损关闭状态={','.join(trail_off) if trail_off else '无(全状态启用)'}；"
             f"{'quality 质量排序入场' if by_quality else '先到先得'}"
+            f"{f'（含大成交额惩罚 w={liq_penalty:g}）' if (by_quality and liq_penalty) else ''}"
             f"{'；多策略联合' if combined else ''}"
         ),
         "range": f"{panel['date'].min().date()} ~ {panel['date'].max().date()}",
@@ -519,9 +555,13 @@ def _print_res(res: dict) -> None:
         budget_note = (
             f" | 预算上限跳过 {st['skipped_budget']}" if st.get("skipped_budget", 0) else ""
         )
+        trail_note = (
+            f" | 移动止损按状态关闭 {st['trail_suppressed']} 次"
+            if st.get("trail_suppressed", 0) else ""
+        )
         print(f"  统计: 入场涨停剔除 {st['entry_blocked']} | 满仓跳过 {st['skipped_cap']}"
               f" | 现金不足 {st['skipped_cash']}{budget_note}"
-              f" | 卖出顺延 {st['exit_extended']} 仍封死 {st['exit_still_blocked']}")
+              f" | 卖出顺延 {st['exit_extended']} 仍封死 {st['exit_still_blocked']}{trail_note}")
 
 
 def main() -> None:
@@ -543,12 +583,19 @@ def main() -> None:
     parser.add_argument("--chandelier-k", type=float, default=CHANDELIER_K)
     parser.add_argument("--quality", action="store_true",
                         help="按信号质量分排序入场（默认先到先得）")
+    parser.add_argument("--liq-penalty", type=float, default=0.0,
+                        help="quality 分叠加的大成交额惩罚权重（0=关闭；测试值 10/20/30）")
     parser.add_argument("--combined", action="store_true",
                         help="多策略联合组合（同一资金池）")
     parser.add_argument("--regime-filter", action="store_true",
                         help="按市场状态机过滤信号（avoid 状态剔除）")
     parser.add_argument("--risk-budget", action="store_true",
                         help="按市场状态缩放总仓位（up_low满仓/up_high 40%/down_high 60%/down_low 30%）")
+    parser.add_argument("--trail-off-regime", action="append", default=None,
+                        help="在这些市场状态下关闭移动止损（可多次，如 --trail-off-regime up_low）；"
+                             "缺省=用 strategy_map.TRAIL_OFF_REGIMES 单一声明（当前 up_low）")
+    parser.add_argument("--no-trail-off", action="store_true",
+                        help="所有状态都启用移动止损（关闭按状态启停）")
     parser.add_argument("--json-out")
     args = parser.parse_args()
 
@@ -557,8 +604,10 @@ def main() -> None:
         capital=args.capital, max_pos=args.max_pos, daily_k=args.daily_k,
         pos_size=args.pos_size, cost_bps=args.cost_bps, hold_days=args.hold_days,
         stop_loss=args.stop_loss, chandelier_k=args.chandelier_k,
-        by_quality=args.quality, combined=args.combined,
+        by_quality=args.quality, liq_penalty=args.liq_penalty, combined=args.combined,
         regime_filter=args.regime_filter, risk_budget=args.risk_budget,
+        trail_off_regimes=(() if args.no_trail_off
+                           else (tuple(args.trail_off_regime) if args.trail_off_regime else None)),
         json_out=args.json_out,
     )
     _print_res(res)

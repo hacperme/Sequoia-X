@@ -58,6 +58,22 @@ _REGIME_EVIDENCE = {
 }
 
 
+# ── 移动止损（吊灯）按状态启停：单一声明，供 portfolio / tracker 引用 ──
+# 依据 2026-09-22 退出规则评估（5 变体 × 5 单元 × {1y,2y,all} 共 60 组，net 25bp）：
+#   仅 up_low（低波慢牛）关闭移动止损 → RPS 1y 持平(-0.2)、2y +5.6pp、all(2.7y) +5.5pp
+#   而上涨态全关（含 up_high 情绪顶）反而 1y -6.3pp → **up_high 必须保留止损**
+#   其它硬约束：时间上限不可取消（3/5 策略两期同向更差）、K 不可收紧（4/4 策略不优）
+# ⚠️ 库内数据仅到 2024-01、无真正熊市样本；扩大关闭范围前必须有新的两期同向证据。
+TRAIL_OFF_REGIMES: tuple[str, ...] = ("up_low",)
+
+
+def trail_enabled(regime: str | None, off: tuple[str, ...] | None = None) -> bool:
+    """该市场状态下是否启用移动止损（吊灯/固定止损）。regime 未知（None/na）时**启用**（保守）。"""
+    if regime is None:
+        return True
+    return regime not in (TRAIL_OFF_REGIMES if off is None else off)
+
+
 def get_advice(regime: str) -> dict:
     """返回该状态的策略建议（未知状态返回空建议）。"""
     return REGIME_ADVICE.get(regime, {"focus": [], "avoid": [], "note": ""})

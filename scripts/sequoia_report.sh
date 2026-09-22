@@ -205,6 +205,11 @@ try:
     lines.append('')
     lines.append(f\"🚪 离场提示: 持仓 {len(rows)} 只（按个股合并）｜建议离场 {len(trig)} 只（到期 {n_time}｜吊灯 {n_ch}）\")
     lines.append(f\"   口径：持有满该股定档持有期（按信号来源策略；老批次 {tk.EXIT_HOLD_DAYS} 日）或 收盘 < 峰值−{tk.EXIT_CHANDELIER_K}×ATR14\")
+    # 移动止损按状态启停（与 tracker.report 同口径，勿只改一处）
+    _off = [r for r in rows if not r.get('trail_on', True)]
+    if rows and len(_off) == len(rows):
+        _rg = next((r.get('regime') for r in rows if r.get('regime')), '?')
+        lines.append(f\"   ⚠️ 当前状态 {_rg} 属移动止损关闭区间：本次只提示到期，不提示吊灯破位（2026-09-22 退出规则评估口径）\")
     if trig:
         for r in trig:
             hd = r['hold_days']
