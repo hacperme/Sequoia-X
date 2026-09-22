@@ -39,7 +39,8 @@ from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.backtest import _load_panel, _fetch_index, compute_events
-from sequoia_x.strategy import DEFAULT_HOLD_DAYS, hold_days_for
+from sequoia_x.strategy import (DEFAULT_HOLD_DAYS, hold_days_for,
+                                trail_off_regimes_all, trail_off_regimes_for)
 from sequoia_x.strategy_map import TRAIL_OFF_REGIMES, trail_enabled
 
 logger = get_logger(__name__)
@@ -141,7 +142,7 @@ class PortfolioSim:
         chandelier_k: float = CHANDELIER_K,
         use_risk_budget: bool = False,
         states: pd.DataFrame | None = None,
-        trail_off_regimes: tuple[str, ...] | None = None,
+        trail_off_regimes: tuple[str, ...] = (),
     ) -> None:
         self.panel = panel
         self.events = events.sort_values(["date", "symbol"]).reset_index(drop=True)
@@ -157,8 +158,10 @@ class PortfolioSim:
         self.chandelier_k = chandelier_k
         self.use_risk_budget = use_risk_budget
         self._states = states if states is not None else pd.DataFrame()
-        # 移动止损按状态启停：None = 用单一声明 TRAIL_OFF_REGIMES；() = 全状态都启用（关闭该策略）
-        self.trail_off_regimes = tuple(TRAIL_OFF_REGIMES if trail_off_regimes is None else trail_off_regimes)
+        # 移动止损按状态启停：调用方传「本单元」的关闭状态清单（缺省 () = 不关闭，保守）。
+        # 按策略声明由 run_portfolio 解析（strategy.StrategySpec.trail_off_regimes；
+        # 多策略联合取参与策略交集），此处不再兜底到全局白名单。
+        self.trail_off_regimes = tuple(trail_off_regimes or ())
 
         # 每股价格序列缓存 {symbol: df.set_index(date)}
         self._px: dict[str, pd.DataFrame] = {}
@@ -466,9 +469,18 @@ def run_portfolio(
         events, dropped = apply_regime_filter(events, states)
         logger.info(f"regime 过滤: {dropped}")
     # 风险预算 / 移动止损启停 都需要市场状态序列
-    trail_off = tuple(TRAIL_OFF_REGIMES if trail_off_regimes is None else trail_off_regimes)
+    # trail_off_regimes：None = 按策略声明（RPS 突破 → up_low；联合池取参与策略交集）；
+    #                    () = 全状态启用（关闭该机制）；非空元组 = 显式指定（覆盖声明）
+    explicit_trail = trail_off_regimes is not None
+    unit_names = list(events)
+    if explicit_trail:
+        trail_off_by_unit = {n: tuple(trail_off_regimes) for n in unit_names}
+        trail_off_by_unit["多策略联合"] = tuple(trail_off_regimes)
+    else:
+        trail_off_by_unit = {n: trail_off_regimes_for(n) for n in unit_names}
+        trail_off_by_unit["多策略联合"] = trail_off_regimes_all(unit_names)
     states_df = None
-    if risk_budget or trail_off:
+    if risk_budget or any(trail_off_by_unit.values()):
         from sequoia_x.regime import get_market_states
 
         states_df = get_market_states(engine.db_path, refresh=True)
@@ -496,7 +508,7 @@ def run_portfolio(
             pos_size=pos_size, cost_bps=cost_bps, hold_days=h_combined,
             exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
             use_risk_budget=risk_budget, states=states_df,
-            trail_off_regimes=trail_off,
+            trail_off_regimes=trail_off_by_unit["多策略联合"],
         )
         out["多策略联合"] = sim.run()
         logger.info(f"多策略联合组合模拟完成（exit={exit_mode}, quality={by_quality}, budget={risk_budget}）")
@@ -509,7 +521,7 @@ def run_portfolio(
                 pos_size=pos_size, cost_bps=cost_bps, hold_days=h,
                 exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
                 use_risk_budget=risk_budget, states=states_df,
-                trail_off_regimes=trail_off,
+                trail_off_regimes=trail_off_by_unit.get(name, ()),
             )
             out[name] = sim.run()
             logger.info(f"{name} 组合模拟完成（exit={exit_mode} quality={by_quality} budget={risk_budget}）")
@@ -520,12 +532,24 @@ def run_portfolio(
             f"{n} {hold_days_for(n)}d" for n in events)
         if combined and h_combined is not None:
             hold_txt += f"｜联合 {h_combined}d"
+    if explicit_trail:
+        trail_txt = (f"{'/'.join(trail_off_regimes)}（显式指定）" if trail_off_regimes
+                     else "无(全状态启用)")
+    else:
+        if combined:
+            trail_txt = (f"按策略声明；联合池={','.join(trail_off_by_unit['多策略联合']) or '无(全状态启用)'}"
+                         f"（取参与策略交集，见 StrategySpec.trail_off_regimes）")
+        else:
+            _declared = {n: v for n, v in trail_off_by_unit.items()
+                         if v and n != "多策略联合"}
+            trail_txt = ("按策略声明 " + "/".join(
+                f"{n} {'/'.join(v)}" for n, v in _declared.items())) if _declared else "无(全状态启用)"
     res = {
         "method": "portfolio-sim-p1",
         "note": (
             f"收盘决策次日开盘成交；exit={exit_mode}；max_pos={max_pos} daily_k={daily_k} "
             f"pos_size={pos_size} {hold_txt} 成本{cost_bps}bp；一手100股；"
-            f"移动止损关闭状态={','.join(trail_off) if trail_off else '无(全状态启用)'}；"
+            f"移动止损关闭状态={trail_txt}；"
             f"{'quality 质量排序入场' if by_quality else '先到先得'}"
             f"{f'（含大成交额惩罚 w={liq_penalty:g}）' if (by_quality and liq_penalty) else ''}"
             f"{'；多策略联合' if combined else ''}"
@@ -592,10 +616,11 @@ def main() -> None:
     parser.add_argument("--risk-budget", action="store_true",
                         help="按市场状态缩放总仓位（up_low满仓/up_high 40%/down_high 60%/down_low 30%）")
     parser.add_argument("--trail-off-regime", action="append", default=None,
-                        help="在这些市场状态下关闭移动止损（可多次，如 --trail-off-regime up_low）；"
-                             "缺省=用 strategy_map.TRAIL_OFF_REGIMES 单一声明（当前 up_low）")
+                        help="显式在这些市场状态下关闭移动止损（可多次，如 --trail-off-regime up_low）；"
+                             "缺省=按策略声明（strategy.StrategySpec.trail_off_regimes，"
+                             "当前仅 RPS 突破=up_low；联合池取参与策略交集）")
     parser.add_argument("--no-trail-off", action="store_true",
-                        help="所有状态都启用移动止损（关闭按状态启停）")
+                        help="所有状态都启用移动止损（把按策略启停整体关掉，= 旧口径）")
     parser.add_argument("--json-out")
     args = parser.parse_args()
 

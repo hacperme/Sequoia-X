@@ -204,12 +204,14 @@ try:
     n_ch = sum(1 for r in trig if 'chandelier' in r['triggers'])
     lines.append('')
     lines.append(f\"🚪 离场提示: 持仓 {len(rows)} 只（按个股合并）｜建议离场 {len(trig)} 只（到期 {n_time}｜吊灯 {n_ch}）\")
-    lines.append(f\"   口径：持有满该股定档持有期（按信号来源策略；老批次 {tk.EXIT_HOLD_DAYS} 日）或 收盘 < 峰值−{tk.EXIT_CHANDELIER_K}×ATR14\")
-    # 移动止损按状态启停（与 tracker.report 同口径，勿只改一处）
+    _decl = tk._trail_off_declared()
+    _decl_txt = ('；移动止损按来源策略启停：' + '、'.join(f'{n}→{"/".join(v)} 不提示吊灯' for n, v in _decl.items())) if _decl else ''
+    lines.append(f\"   口径：持有满该股定档持有期（按信号来源策略；老批次 {tk.EXIT_HOLD_DAYS} 日）或 收盘 < 峰值−{tk.EXIT_CHANDELIER_K}×ATR14{_decl_txt}\")
+    # 移动止损按「来源策略声明」启停（与 tracker.report 同口径，勿只改一处）
     _off = [r for r in rows if not r.get('trail_on', True)]
-    if rows and len(_off) == len(rows):
-        _rg = next((r.get('regime') for r in rows if r.get('regime')), '?')
-        lines.append(f\"   ⚠️ 当前状态 {_rg} 属移动止损关闭区间：本次只提示到期，不提示吊灯破位（2026-09-22 退出规则评估口径）\")
+    if _off:
+        _rg = next((r.get('regime') for r in _off if r.get('regime')), '?')
+        lines.append(f\"   ⚠️ 当前状态 {_rg}：本次有 {len(_off)}/{len(rows)} 只（来源策略已声明关闭移动止损，如 RPS 突破）只提示到期、不提示吊灯破位（2026-09-22 退出规则评估口径）\")
     if trig:
         for r in trig:
             hd = r['hold_days']

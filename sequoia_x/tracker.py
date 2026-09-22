@@ -34,6 +34,7 @@ STAMP_TAX = 0.0005            # 印花税（卖出才收，买入不计）
 SLIPPAGE = 0.001              # 滑点 千1
 HOLD_DAYS = 20                # 最长跟踪交易日
 _BATCH_HDR = {"signal_date", "regime", "status", "entry_date", "n_target", "codes", "holds",
+              "trail_off",
               "entries", "equity_dates", "equity_values", "hs300_values"}
 
 
@@ -136,6 +137,7 @@ def register(state: dict, report_path: str, meta_path: str | None = None) -> int
         "n_target": len(codes),
         "codes": codes,
         "holds": holds,   # {code: 持有期(交易日)}，按信号来源策略定档
+        "trail_off": _code_trail_off(cross),   # {code: 该股关闭移动止损的状态}（按来源策略声明）
         "entries": [],   # [{code, qty, price, date}]
         "equity_dates": [],
         "equity_values": [],
@@ -330,14 +332,41 @@ def _code_holds(cross: list[dict]) -> dict[str, int]:
     return out
 
 
-def _trail_off_regimes() -> tuple[str, ...]:
-    """移动止损按状态关闭的清单（单一声明在 strategy_map.TRAIL_OFF_REGIMES）。导入失败=不关闭。"""
-    try:
-        from sequoia_x.strategy_map import TRAIL_OFF_REGIMES
+def _code_trail_off(cross: list[dict]) -> dict[str, tuple[str, ...]]:
+    """日报 cross_hits → {code: 关闭移动止损的状态}。
 
-        return tuple(TRAIL_OFF_REGIMES)
-    except Exception:
+    按信号来源策略声明（`StrategySpec.trail_off_regimes`）；同股多策略命中取**交集**
+    （保守：只有命中的策略全都声明关闭才关）。命中策略未声明 → 该股 ()（不关闭）。
+    """
+    try:
+        from sequoia_x.strategy import trail_off_regimes_all
+
+        return {c["code"]: trail_off_regimes_all(list(c.get("strategies") or []))
+                for c in cross}
+    except Exception:            # strategy 包不可导入时不减噪（保守）
+        return {}
+
+
+def _trail_off_for_code(state: dict, code: str) -> tuple[str, ...]:
+    """该股（可能跨批次）关闭移动止损的状态 = 各注册批次声明的交集。
+
+    ⚠️ 2026-09-21 前的老批次没有 `trail_off` 字段 → 返回 () = 不减噪（保守，保持旧行为）。
+    """
+    decls = [set(b["trail_off"][code]) for b in state.get("batches", [])
+             if isinstance(b.get("trail_off"), dict) and code in b["trail_off"]]
+    if not decls:
         return ()
+    return tuple(sorted(set.intersection(*decls)))
+
+
+def _trail_off_declared() -> dict[str, tuple[str, ...]]:
+    """{策略中文名: 关闭移动止损的状态}（只含非空项），供口径行展示。导入失败=空。"""
+    try:
+        from sequoia_x.strategy import trail_off_regimes_map
+
+        return trail_off_regimes_map()
+    except Exception:
+        return {}
 
 
 def _current_regime() -> str | None:
@@ -432,17 +461,17 @@ def exit_signals(state: dict, regime: str | None = None) -> list[dict]:
 
     触发：① 到期——持有满该股定档持有期（按信号来源策略，见 _hold_for_code()，
     老批次回退 EXIT_HOLD_DAYS）；② 吊灯止损——收盘 < 峰值−K×ATR14。
-    ⚠️ 移动止损按市场状态启停（strategy_map.TRAIL_OFF_REGIMES，当前 up_low）：
-    up_low 低波慢牛里**只提示到期、不提示吊灯**（2026-09-22 退出规则评估：该状态关吊灯
-    RPS 1y 持平 / 2y +5.6pp / all +5.5pp，且能减少慢牛中被震出的噪声提醒）。
-    regime 未知时保守启用吊灯。
+    ⚠️ 移动止损按**来源策略声明**启停（`StrategySpec.trail_off_regimes`，当前只有
+    RPS 突破声明 up_low，见 _code_trail_off()/_trail_off_for_code()）：该股来源策略在当日
+    市场状态下关闭吊灯时，**只提示到期、不提示吊灯**（2026-09-22 评估：R2 只在 RPS 单元
+    三窗口从不变差；海龟/联合池两期不同向，故不扩大范围）。regime 未知时保守启用吊灯；
+    老批次（无 trail_off 字段）不减噪。
     ⚠️ 只为持仓提供"该走了"提醒，不构成实盘持仓宣称：方案 A 是模拟盘（每批独立
     100 万名义本金、100 股整手），与用户真实持仓无关，需自行对照。
     """
     dates = _trading_dates()
     latest = dates[-1]
     regime = regime if regime is not None else _current_regime()
-    trail_on = regime not in _trail_off_regimes()   # regime 未知(None) → 不在清单 → 启用
     agg: dict[str, dict] = {}
     for b in state["batches"]:
         if b["status"] != "bought":
@@ -471,6 +500,8 @@ def exit_signals(state: dict, regime: str | None = None) -> list[dict]:
         atr = _atr14(code, latest)
         trail = (peak - EXIT_CHANDELIER_K * atr) if atr else None
         hold = _hold_for_code(state, code)   # 按信号来源策略定档（海龟20/RPS30/上升跌停40…）
+        off = _trail_off_for_code(state, code)          # 该股来源策略声明的关闭状态
+        trail_on = regime is None or regime not in off  # regime 未知 → 保守启用
         trig: list[str] = []
         if bars >= hold:
             trig.append("time")
@@ -540,17 +571,20 @@ def report(state: dict, exit_rows: list[dict] | None = None,
         out.append(f"  持仓 {len(exit_rows)} 只（按个股合并）｜建议离场 {len(ex)} 只"
                    f"（到期 {n_time}｜吊灯 {n_ch}）")
         _hm = _hold_map()
-        _off = _trail_off_regimes()
-        trail_on = all(r.get("trail_on", True) for r in exit_rows)
+        _decl = _trail_off_declared()
+        _off_rows = [r for r in exit_rows if not r.get("trail_on", True)]
         out.append(f"  口径：持有满该股定档持有期（按信号来源策略："
                    + "/".join(f"{n}{h}日" for n, h in _hm.items())
                    + f"；老批次 {EXIT_HOLD_DAYS} 日）或 收盘 < 峰值−"
-                   f"{EXIT_CHANDELIER_K:g}×ATR14")
-        if not trail_on:
-            _rg = next((r.get("regime") for r in exit_rows if r.get("regime")), "?")
-            out.append(f"  ⚠️ 当前状态 {_rg} 属移动止损关闭区间"
-                       + (f"（{'/'.join(_off)}）" if _off else "")
-                       + "：本次只提示到期，不提示吊灯破位（2026-09-22 退出规则评估口径）")
+                   f"{EXIT_CHANDELIER_K:g}×ATR14"
+                   + (f"；移动止损按来源策略启停：" +
+                      "、".join(f"{n}→{'/'.join(v)} 不提示吊灯" for n, v in _decl.items())
+                      if _decl else ""))
+        if _off_rows:
+            _rg = next((r.get("regime") for r in _off_rows if r.get("regime")), "?")
+            out.append(f"  ⚠️ 当前状态 {_rg}：本次有 {len(_off_rows)}/{len(exit_rows)} 只"
+                       "（来源策略已声明关闭移动止损，如 RPS 突破）只提示到期、不提示吊灯破位"
+                       "（2026-09-22 退出规则评估口径）")
         if ex:
             for r in ex:
                 nm = (names or {}).get(r["code"], "")

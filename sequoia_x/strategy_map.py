@@ -58,20 +58,31 @@ _REGIME_EVIDENCE = {
 }
 
 
-# ── 移动止损（吊灯）按状态启停：单一声明，供 portfolio / tracker 引用 ──
+# ── 移动止损（吊灯）按状态启停：**有证据的状态白名单** ──
 # 依据 2026-09-22 退出规则评估（5 变体 × 5 单元 × {1y,2y,all} 共 60 组，net 25bp）：
 #   仅 up_low（低波慢牛）关闭移动止损 → RPS 1y 持平(-0.2)、2y +5.6pp、all(2.7y) +5.5pp
 #   而上涨态全关（含 up_high 情绪顶）反而 1y -6.3pp → **up_high 必须保留止损**
 #   其它硬约束：时间上限不可取消（3/5 策略两期同向更差）、K 不可收紧（4/4 策略不优）
 # ⚠️ 库内数据仅到 2024-01、无真正熊市样本；扩大关闭范围前必须有新的两期同向证据。
+#
+# ⚠️ 2026-09-22 复核修正（**本常量只是白名单，不再是全局默认**）：
+#   按单元补齐证据后发现 R2 只在 RPS 突破成立（1y -0.2 / 2y +5.6 / all +5.5 从不变差），
+#   而海龟 2y -1.7pp、多策略联合 1y -6.3→-9.1（-2.8pp）两期不同向。
+#   → 「哪个策略在哪些状态关止损」的单一声明改为 `strategy.StrategySpec.trail_off_regimes`
+#   （当前只有 RPS 突破声明 ("up_low",)）；本常量退化为**允许声明**的状态白名单
+#   （tests/test_regime_exit.py 断言各策略声明 ⊆ 本白名单）。联合池取参与策略交集 → 全关。
 TRAIL_OFF_REGIMES: tuple[str, ...] = ("up_low",)
 
 
-def trail_enabled(regime: str | None, off: tuple[str, ...] | None = None) -> bool:
-    """该市场状态下是否启用移动止损（吊灯/固定止损）。regime 未知（None/na）时**启用**（保守）。"""
+def trail_enabled(regime: str | None, off: tuple[str, ...] = ()) -> bool:
+    """该市场状态下是否启用移动止损（吊灯/固定止损）。
+
+    `off` = 该策略声明的关闭状态（缺省 () = 不关闭 —— 保守默认，避免忘传参数就走到
+    「全局关闭」）。regime 未知（None/na）时**启用**。
+    """
     if regime is None:
         return True
-    return regime not in (TRAIL_OFF_REGIMES if off is None else off)
+    return regime not in off
 
 
 def get_advice(regime: str) -> dict:

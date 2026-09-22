@@ -41,6 +41,16 @@ class StrategySpec:
     cn_name: str
     backtest: bool = True
     hold_days: int = DEFAULT_HOLD_DAYS
+    trail_off_regimes: tuple[str, ...] = ()
+    """该策略在哪些市场状态下**关闭移动止损**（空 = 不关闭，保守默认）。
+
+    单一来源（按策略声明）：组合层与 tracker 据此决定「该策略来源的持仓」是否在
+    这些状态下停用吊灯。⚠️ 只能声明 `strategy_map.TRAIL_OFF_REGIMES`（有证据的状态
+    白名单）里的状态。2026-09-22 复核：R2 只在 **RPS 突破**上三窗口从不变差
+    （1y 持平 / 2y +5.6pp / 全量 +5.5pp）；海龟（2y −1.7pp）与多策略联合
+    （1y −2.8pp）两期不同向 → 只有 RPS 声明。**新增声明前必须按单元（含 --combined）
+    跑两期 A/B**。
+    """
 
 
 # 顺序即实盘/日报的执行与展示顺序；新增策略在此追加即可
@@ -50,7 +60,8 @@ STRATEGY_REGISTRY: list[StrategySpec] = [
     StrategySpec(HighTightFlagStrategy, "高窄旗形", hold_days=20),
     StrategySpec(LimitUpShakeoutStrategy, "涨停洗盘", hold_days=20),
     StrategySpec(UptrendLimitDownStrategy, "上升跌停", hold_days=40),
-    StrategySpec(RpsBreakoutStrategy, "RPS 突破", hold_days=30),
+    StrategySpec(RpsBreakoutStrategy, "RPS 突破", hold_days=30,
+                 trail_off_regimes=("up_low",)),
     StrategySpec(PrivatePlacementStrategy, "定增公告", backtest=False, hold_days=20),
 ]
 
@@ -66,4 +77,32 @@ def hold_days_for(cn_name: str, default: int = DEFAULT_HOLD_DAYS) -> int:
 def hold_days_map() -> dict[str, int]:
     """{策略中文名: 持有期(交易日)}，供 tracker 按信号来源定档。"""
     return {spec.cn_name: spec.hold_days for spec in STRATEGY_REGISTRY}
+
+
+def trail_off_regimes_for(cn_name: str) -> tuple[str, ...]:
+    """策略中文名 → 该策略关闭移动止损的市场状态（未注册/未声明 → ()，保守全启用）。"""
+    for spec in STRATEGY_REGISTRY:
+        if spec.cn_name == cn_name:
+            return tuple(spec.trail_off_regimes)
+    return ()
+
+
+def trail_off_regimes_map() -> dict[str, tuple[str, ...]]:
+    """{策略中文名: 关闭移动止损的状态}（只含非空项），供 tracker 按信号来源定档。"""
+    return {spec.cn_name: tuple(spec.trail_off_regimes)
+            for spec in STRATEGY_REGISTRY if spec.trail_off_regimes}
+
+
+def trail_off_regimes_all(cn_names: "list[str] | tuple[str, ...]") -> tuple[str, ...]:
+    """多策略联合/同股多策略命中 → 关闭移动止损的状态 = 各参与策略声明的**交集**（保守）。
+
+    联合池的持仓不记来源策略（合并事件里没有 strategy 标签），无法按策略区分，
+    故取最保守口径：只有「所有参与策略都声明关闭」的状态才会在池内关闭。
+    例：RPS=("up_low",) 与海龟=() 同池 → 交集 () → 联合池不关闭（= 旧口径）。
+    """
+    sets = [set(trail_off_regimes_for(n)) for n in cn_names]
+    if not sets:
+        return ()
+    out = set.intersection(*sets)
+    return tuple(s for s in ("up_low", "up_high", "down_high", "down_low") if s in out)
 
