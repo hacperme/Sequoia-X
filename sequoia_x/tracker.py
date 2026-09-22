@@ -33,7 +33,8 @@ COMMISSION = 0.00025          # 佣金 万2.5
 STAMP_TAX = 0.0005            # 印花税（卖出才收，买入不计）
 SLIPPAGE = 0.001              # 滑点 千1
 HOLD_DAYS = 20                # 最长跟踪交易日
-_BATCH_HDR = {"signal_date", "regime", "status", "entry_date", "n_target", "entries", "equity_dates", "equity_values", "hs300_values"}
+_BATCH_HDR = {"signal_date", "regime", "status", "entry_date", "n_target", "codes", "holds",
+              "entries", "equity_dates", "equity_values", "hs300_values"}
 
 
 # ---------- 数据读取 ----------
@@ -126,6 +127,7 @@ def register(state: dict, report_path: str, meta_path: str | None = None) -> int
         print(f"[register] {sig_date} 批次已注册，跳过")
         return 0
     codes = [c["code"] for c in cross]
+    holds = _code_holds(cross)
     state["batches"].append({
         "signal_date": sig_date,
         "regime": (rep.get("regime") or {}).get("regime", "?"),
@@ -133,6 +135,7 @@ def register(state: dict, report_path: str, meta_path: str | None = None) -> int
         "entry_date": None,
         "n_target": len(codes),
         "codes": codes,
+        "holds": holds,   # {code: 持有期(交易日)}，按信号来源策略定档
         "entries": [],   # [{code, qty, price, date}]
         "equity_dates": [],
         "equity_values": [],
@@ -287,14 +290,51 @@ def track(state: dict) -> None:
         _save_state(state)
 
 
-# ---------- 离场提示（2026-09-18 新增） ----------
-# 依据 1Y 组合层 A/B（RPS95，同参数只换出场模式）：
-#   hold=10 + 吊灯  净 +2.2% / 回撤 -7.2% / 胜率 44.1%   ← 采用
-#   hold=20 + 吊灯  净 -0.6% / 回撤 -9.7% / 胜率 42.2%
-#   固定止损 -8%    净 +0.2% / 回撤 -8.8% / 胜率 29.8%   ← 不用：65% 仓位被震出
-# 故到期取 10 交易日 + 吊灯止损(3×ATR14) 辅助。详见仓库 SKILL.md 第 6 节。
-EXIT_HOLD_DAYS = 10
+# ---------- 离场提示（2026-09-18 新增；2026-09-21 升级为按策略定档） ----------
+# 出场模式（1Y 组合层 A/B，RPS95，同参数只换出场模式）：
+#   吊灯止损 3×ATR14  ← 采用（优于固定 -8%：后者 65% 仓位被震出、胜率仅 29.8%）
+# 到期窗口（2026-09-21 重做 5/10/20/30/40 日 × 1Y+2Y 全扫描）：
+#   旧口径全局 10 日已弃用 —— 它来自 RPS95 单期 A/B（10 日 +2.2% vs 20 日 -0.6%），
+#   两期扫描显示 RPS 逐笔均收益到 30 日仍升、海龟 20 日最优，故改为按信号来源策略定档
+#   （strategy.StrategySpec.hold_days，同股多策略命中取最大值）。详见仓库 SKILL.md 第 6 节。
+EXIT_HOLD_DAYS = 20
+"""离场「到期」的**回退**持有期（交易日），仅用于老批次（2026-09-21 前的状态无策略登记）。
+新批次按信号来源策略定档，见 _hold_for_code()。
+
+⚠️ 2026-09-21 由 10 改为 20 并升级为按策略分档：此前 tracker 用全局 10 日，与组合层
+per-strategy hold（海龟 20 / RPS 30 / 上升跌停 40）不一致，会给趋势类持仓发过早的到期提醒；
+而当初选 10 的依据是 RPS95 单期 A/B（hold=10 +2.2% vs hold=20 -0.6%），该结论已被
+5/10/20/30/40 日 × 1Y+2Y 全扫描推翻（RPS 逐笔均收益两期一致升到 30 日；详见仓库 SKILL.md 第 6 节）。
+"""
 EXIT_CHANDELIER_K = 3.0
+
+
+def _hold_map() -> dict[str, int]:
+    """策略中文名 → 持有期（交易日）。惰性导入 strategy 包，失败则返回空（回退 EXIT_HOLD_DAYS）。"""
+    try:
+        from sequoia_x.strategy import hold_days_map
+
+        return hold_days_map()
+    except Exception:  # 包不可导入时不影响离场提示
+        return {}
+
+
+def _code_holds(cross: list[dict]) -> dict[str, int]:
+    """日报 cross_hits → {code: 持有期(交易日)}：取该股命中策略里的最大值
+    （让趋势类策略的长持有期不被短策略截断）。"""
+    hm = _hold_map()
+    out: dict[str, int] = {}
+    for c in cross:
+        vals = [hm[s] for s in (c.get("strategies") or []) if s in hm]
+        out[c["code"]] = max(vals) if vals else EXIT_HOLD_DAYS
+    return out
+
+
+def _hold_for_code(state: dict, code: str) -> int:
+    """该股本批登记的策略定档持有期；多个批次取最大值，无登记则回退 EXIT_HOLD_DAYS。"""
+    vals = [b["holds"][code] for b in state["batches"]
+            if isinstance(b.get("holds"), dict) and code in b["holds"]]
+    return max(vals) if vals else EXIT_HOLD_DAYS
 NAMES_PATH = os.path.join(os.path.dirname(DB_PATH), "stock_names.json")
 NAMES_TTL_DAYS = 7
 
@@ -369,7 +409,8 @@ def _shift_trade_days(dates: list[str], after: str, n: int) -> str | None:
 def exit_signals(state: dict) -> list[dict]:
     """对已买入批次的所有持仓（按个股合并）算离场条件，返回按浮亏升序的清单。
 
-    触发：① 到期——持有满 EXIT_HOLD_DAYS 个交易日；② 吊灯止损——收盘 < 峰值−K×ATR14。
+    触发：① 到期——持有满该股定档持有期（按信号来源策略，见 _hold_for_code()，
+    老批次回退 EXIT_HOLD_DAYS）；② 吊灯止损——收盘 < 峰值−K×ATR14。
     ⚠️ 只为持仓提供"该走了"提醒，不构成实盘持仓宣称：方案 A 是模拟盘（每批独立
     100 万名义本金、100 股整手），与用户真实持仓无关，需自行对照。
     """
@@ -402,8 +443,9 @@ def exit_signals(state: dict) -> list[dict]:
         bars = len([d for d in dates if a["first"] <= d <= latest])
         atr = _atr14(code, latest)
         trail = (peak - EXIT_CHANDELIER_K * atr) if atr else None
+        hold = _hold_for_code(state, code)   # 按信号来源策略定档（海龟20/RPS30/上升跌停40…）
         trig: list[str] = []
-        if bars >= EXIT_HOLD_DAYS:
+        if bars >= hold:
             trig.append("time")
         if trail is not None and cur <= trail:
             trig.append("chandelier")
@@ -413,7 +455,8 @@ def exit_signals(state: dict) -> list[dict]:
             "atr14": round(atr, 3) if atr else None,
             "trail": round(trail, 2) if trail is not None else None,
             "bars": bars, "ret_pct": round((cur / ep - 1) * 100, 2),
-            "due_date": _shift_trade_days(dates, a["first"], EXIT_HOLD_DAYS),
+            "hold_days": hold,   # 该股定档持有期（到期口径）
+            "due_date": _shift_trade_days(dates, a["first"], hold),
             "triggers": trig,
         })
     rows.sort(key=lambda r: r["ret_pct"])
@@ -468,14 +511,17 @@ def report(state: dict, exit_rows: list[dict] | None = None,
         out.append("🚪 离场提示（模拟持仓，非实盘；请自行对照）")
         out.append(f"  持仓 {len(exit_rows)} 只（按个股合并）｜建议离场 {len(ex)} 只"
                    f"（到期 {n_time}｜吊灯 {n_ch}）")
-        out.append(f"  口径：持有满 {EXIT_HOLD_DAYS} 交易日 或 收盘 < 峰值−"
+        _hm = _hold_map()
+        out.append(f"  口径：持有满该股定档持有期（按信号来源策略："
+                   + "/".join(f"{n}{h}日" for n, h in _hm.items())
+                   + f"；老批次 {EXIT_HOLD_DAYS} 日）或 收盘 < 峰值−"
                    f"{EXIT_CHANDELIER_K:g}×ATR14")
         if ex:
             for r in ex:
                 nm = (names or {}).get(r["code"], "")
                 tags = []
                 if "time" in r["triggers"]:
-                    tags.append("到期%d日" % EXIT_HOLD_DAYS)
+                    tags.append("到期%d日" % r["hold_days"])
                 if "chandelier" in r["triggers"]:
                     tags.append("吊灯止损")
                 due = f" 到期日{r['due_date']}" if (r["due_date"] and "time" in r["triggers"]) else ""
@@ -492,10 +538,10 @@ def report(state: dict, exit_rows: list[dict] | None = None,
             # 提前列出便于分散卖出 —— 实测「批内错峰持有期」无可靠收益效应
             # （见 SKILL.md 第 6 节），故不自动错峰，只做预告交人工安排。
             # 注：未来交易日无行情数据、算不出具体日期，故用"还需 N 日"表述。
-            soon = [r for r in hold if 1 <= EXIT_HOLD_DAYS - r["bars"] <= 2]
+            soon = [r for r in hold if 1 <= r["hold_days"] - r["bars"] <= 2]
             if soon:
                 soon_txt = "｜".join(
-                    f"{r['code']}{(names or {}).get(r['code'], '')}还需{EXIT_HOLD_DAYS - r['bars']}日"
+                    f"{r['code']}{(names or {}).get(r['code'], '')}还需{r['hold_days'] - r['bars']}日"
                     for r in sorted(soon, key=lambda x: x["bars"], reverse=True))
                 out.append(f"  ⏳ 即将到期 {len(soon)} 只: {soon_txt}")
     out.append(f"\n批次总计 {len(state['batches'])}，跟踪中 {active}")

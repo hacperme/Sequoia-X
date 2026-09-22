@@ -204,10 +204,11 @@ try:
     n_ch = sum(1 for r in trig if 'chandelier' in r['triggers'])
     lines.append('')
     lines.append(f\"🚪 离场提示: 持仓 {len(rows)} 只（按个股合并）｜建议离场 {len(trig)} 只（到期 {n_time}｜吊灯 {n_ch}）\")
-    lines.append(f\"   口径：持有满 {tk.EXIT_HOLD_DAYS} 交易日 或 收盘 < 峰值−{tk.EXIT_CHANDELIER_K}×ATR14\")
+    lines.append(f\"   口径：持有满该股定档持有期（按信号来源策略；老批次 {tk.EXIT_HOLD_DAYS} 日）或 收盘 < 峰值−{tk.EXIT_CHANDELIER_K}×ATR14\")
     if trig:
         for r in trig:
-            tags = '+'.join({'time': '到期', 'chandelier': '吊灯'}.get(t, t) for t in r['triggers'])
+            hd = r['hold_days']
+            tags = '+'.join({'time': f'到期{hd}日', 'chandelier': '吊灯'}.get(t, t) for t in r['triggers'])
             lines.append(f\"   {r['code']} {names.get(r['code'], '?')}  {r['ret_pct']:+.2f}%  持{r['bars']}日  {tags}\")
     else:
         lines.append('   （今日无触发）')
@@ -216,10 +217,10 @@ try:
         worst = sorted(hold, key=lambda r: r['ret_pct'])[:3]
         txt = '｜'.join(f\"{r['code']}{names.get(r['code'], '?')} {r['ret_pct']:+.2f}%\" for r in worst)
         lines.append(f\"   ⏸ 继续持有 {len(hold)} 只，浮亏最大: {txt}\")
-    soon = [r for r in rows if not r['triggers'] and 1 <= tk.EXIT_HOLD_DAYS - r['bars'] <= 2]
+    soon = [r for r in rows if not r['triggers'] and 1 <= r['hold_days'] - r['bars'] <= 2]
     if soon:
         txt = '｜'.join(
-            f\"{r['code']}{names.get(r['code'], '?')}还需{tk.EXIT_HOLD_DAYS - r['bars']}日\"
+            f\"{r['code']}{names.get(r['code'], '?')}还需{r['hold_days'] - r['bars']}日\"
             for r in sorted(soon, key=lambda x: x['bars'], reverse=True))
         lines.append(f\"   ⏳ 即将到期 {len(soon)} 只: {txt}\")
 except Exception as e:

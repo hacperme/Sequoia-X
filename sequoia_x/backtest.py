@@ -36,6 +36,7 @@ from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.market_rules import limit_up_ratio, limit_down_ratio
+from sequoia_x.strategy import hold_days_for
 
 logger = get_logger(__name__)
 
@@ -391,6 +392,7 @@ def run_backtest(
     rps_threshold: int | None = None,
     with_portfolio: bool = True,
     fetch_index: bool = True,
+    portfolio_hold: int | None = None,
 ) -> dict:
     settings = get_settings()
     engine = DataEngine(settings)
@@ -425,9 +427,10 @@ def run_backtest(
             result[name][f"{h}_exec"] = st
         # MAE/止损统计（固定 10 日窗口）
         result[name]["mae"] = _mae_stats(panel, ev)
-        # 简化组合层（10 日持有）
+        # 简化组合层（持有期按策略注册表定档；portfolio_hold 显式指定时统一覆盖）
         if with_portfolio:
-            result[name]["portfolio"] = _portfolio(panel, ev, 10, cost_bps, index_df)
+            h = portfolio_hold if portfolio_hold is not None else hold_days_for(name)
+            result[name]["portfolio"] = _portfolio(panel, ev, h, cost_bps, index_df)
         logger.info(f"{name} 回测完成")
 
     out = {
@@ -508,6 +511,8 @@ def main() -> None:
     parser.add_argument("--rps-threshold", type=int, default=None,
                         help="RPS 分位阈值（缺省=策略类默认 95，2026-09-17 起）")
     parser.add_argument("--no-portfolio", action="store_true", help="跳过组合层")
+    parser.add_argument("--portfolio-hold", type=int, default=None,
+                        help="组合层持有期(交易日)；缺省=按策略注册表定档")
     parser.add_argument("--no-index", action="store_true", help="跳过沪深300 超额对比")
     parser.add_argument("--grid", action="store_true", help="参数网格模式")
     args = parser.parse_args()
@@ -520,6 +525,7 @@ def main() -> None:
         period=args.period, json_out=args.json_out, cost_bps=args.cost_bps,
         turtle_window=args.turtle_window, rps_threshold=args.rps_threshold,
         with_portfolio=not args.no_portfolio, fetch_index=not args.no_index,
+        portfolio_hold=args.portfolio_hold,
     )
     print(f"回测区间 {res['range']} | {res['n_stocks']} 只(含退市) | {res['n_rows']} 行 | 成本 {args.cost_bps}bp\n")
     for name, horizons in res["strategies"].items():

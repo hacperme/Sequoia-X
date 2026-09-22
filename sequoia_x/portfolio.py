@@ -39,10 +39,11 @@ from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.backtest import _load_panel, _fetch_index, compute_events
+from sequoia_x.strategy import DEFAULT_HOLD_DAYS, hold_days_for
 
 logger = get_logger(__name__)
 
-DEFAULT_HOLD = 20
+DEFAULT_HOLD = DEFAULT_HOLD_DAYS  # 单一来源：sequoia_x.strategy.DEFAULT_HOLD_DAYS
 DEFAULT_STOP = 0.08
 CHANDELIER_K = 3.0
 ATR_WIN = 14
@@ -403,7 +404,7 @@ def run_portfolio(
     daily_k: int = 5,
     pos_size: float | None = None,
     cost_bps: int = 25,
-    hold_days: int = DEFAULT_HOLD,
+    hold_days: int | None = None,
     stop_loss: float = DEFAULT_STOP,
     chandelier_k: float = CHANDELIER_K,
     by_quality: bool = False,
@@ -440,6 +441,7 @@ def run_portfolio(
 
         states_df = get_market_states(engine.db_path, refresh=True)
     out: dict[str, dict] = {}
+    h_combined: int | None = None
 
     if combined and events:
         # 多策略联合组合：全部策略事件合并，同 (symbol,date) 多策略命中只保留一次
@@ -453,9 +455,13 @@ def run_portfolio(
                 .drop_duplicates(subset=["symbol", "date"]).reset_index(drop=True)
         else:
             merged = merged.drop_duplicates(subset=["symbol", "date"]).reset_index(drop=True)
+        # 联合组合的持有期：显式指定优先；未指定则取参与策略的最大值
+        # （避免短持有期砍掉趋势类策略的长信号）
+        h_combined = hold_days if hold_days is not None else max(
+            (hold_days_for(n) for n in events), default=DEFAULT_HOLD)
         sim = PortfolioSim(
             panel, merged, capital=capital, max_pos=max_pos, daily_k=daily_k,
-            pos_size=pos_size, cost_bps=cost_bps, hold_days=hold_days,
+            pos_size=pos_size, cost_bps=cost_bps, hold_days=h_combined,
             exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
             use_risk_budget=risk_budget, states=states_df,
         )
@@ -463,19 +469,28 @@ def run_portfolio(
         logger.info(f"多策略联合组合模拟完成（exit={exit_mode}, quality={by_quality}, budget={risk_budget}）")
     else:
         for name, ev in events.items():
+            # 持有期：显式指定优先，否则按策略注册表定档（单一声明见 strategy.StrategySpec.hold_days）
+            h = hold_days if hold_days is not None else hold_days_for(name)
             sim = PortfolioSim(
                 panel, ev, capital=capital, max_pos=max_pos, daily_k=daily_k,
-                pos_size=pos_size, cost_bps=cost_bps, hold_days=hold_days,
+                pos_size=pos_size, cost_bps=cost_bps, hold_days=h,
                 exit_mode=exit_mode, stop_loss=stop_loss, chandelier_k=chandelier_k,
                 use_risk_budget=risk_budget, states=states_df,
             )
             out[name] = sim.run()
             logger.info(f"{name} 组合模拟完成（exit={exit_mode} quality={by_quality} budget={risk_budget}）")
+    if hold_days is not None:
+        hold_txt = f"hold={hold_days}d（统一指定）"
+    else:
+        hold_txt = "hold=按策略定档 " + "/".join(
+            f"{n} {hold_days_for(n)}d" for n in events)
+        if combined and h_combined is not None:
+            hold_txt += f"｜联合 {h_combined}d"
     res = {
         "method": "portfolio-sim-p1",
         "note": (
             f"收盘决策次日开盘成交；exit={exit_mode}；max_pos={max_pos} daily_k={daily_k} "
-            f"pos_size={pos_size} hold={hold_days}d 成本{cost_bps}bp；一手100股；"
+            f"pos_size={pos_size} {hold_txt} 成本{cost_bps}bp；一手100股；"
             f"{'quality 质量排序入场' if by_quality else '先到先得'}"
             f"{'；多策略联合' if combined else ''}"
         ),
@@ -521,7 +536,9 @@ def main() -> None:
     parser.add_argument("--pos-size", type=float, default=None,
                         help="单票占初始资金比例；缺省=1/max_pos 满仓等权")
     parser.add_argument("--cost-bps", type=int, default=25)
-    parser.add_argument("--hold-days", type=int, default=DEFAULT_HOLD)
+    parser.add_argument("--hold-days", type=int, default=None,
+                        help="持有期(交易日)；缺省=按策略注册表定档"
+                             "（海龟20/涨停洗盘20/上升跌停40/RPS30，见 strategy.StrategySpec）")
     parser.add_argument("--stop-loss", type=float, default=DEFAULT_STOP)
     parser.add_argument("--chandelier-k", type=float, default=CHANDELIER_K)
     parser.add_argument("--quality", action="store_true",
