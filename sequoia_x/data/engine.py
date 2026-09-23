@@ -59,24 +59,84 @@ def _bs_fetch_batch(tasks: list) -> list:
     - 每只失败自动重试 3 次（2s/4s/8s 退避），每次失败 logout+login 重连
       （对齐 backfill 的成熟模式；此前 sync 无重试，单次网络抖动即丢当日数据）
     - 3 次仍失败跳过并记日志（该股留待下次 sync 补，不中断整批）
+
+    看门狗（2026-09-23 增强，解决"query 永久挂死"）：
+    - baostock 的收包循环（`util/socketutil.py send_msg`）靠结束标记 `<![CDATA[]]>`
+      判定读完；服务端不回该标记时**永久阻塞在 recv 上**，且 socket 超时拦不住
+      （超时只在两次 recv 之间生效，循环本身不退出）→ 2026-09-22 的 21:01 cron 与
+      09-23 手动运行各挂死一次：Worker CPU≈0、无 socket 读、日志停在 login success!，
+      wrapper 白等 3600s 后才报同步失败。
+    - 方案：每次 query 前后 arm/clear SIGALRM 看门狗（默认 25s，`SEQUOIA_QUERY_TIMEOUT`
+      可调），到点抛 `_QueryTimeout` 走上面的重连重试；每 `SEQUOIA_RECONNECT_EVERY`
+      （默认 200）只主动重连一次（对齐 backfill 成熟模式）；重连前强制关掉旧 socket
+      避免 fd 泄漏与协议残留。非主线程无法装信号 → 退化为原行为（重试仍在）。
     """
+    import os
+    import signal
     import time
 
     import baostock as bs
 
     logger = __import__("logging").getLogger(__name__)
+    max_retries = 3
+    query_timeout = int(os.environ.get("SEQUOIA_QUERY_TIMEOUT", "25"))
+    reconnect_every = int(os.environ.get("SEQUOIA_RECONNECT_EVERY", "200"))
+
+    class _QueryTimeout(Exception):
+        """看门狗触发的 query 超时（继承 Exception → 走既有重试分支）。"""
+
+    def _on_alarm(signum, frame):  # noqa: ARG001
+        raise _QueryTimeout(f"query 超过 {query_timeout}s 未返回（疑似收包循环挂死）")
+
+    def _drop_socket() -> None:
+        """关掉 baostock 的陈旧 socket（超时后协议已错位，必须丢弃重连）。"""
+        try:
+            from baostock.common import context as _ctx
+
+            sock = getattr(_ctx, "default_socket", None)
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+
+    def _quiet(fn) -> None:
+        """忽略异常的辅助调用（logout/login 自身也可能阻塞）。"""
+        try:
+            if watchdog:
+                signal.alarm(query_timeout)
+            fn()
+        except Exception:
+            pass
+        finally:
+            if watchdog:
+                signal.alarm(0)
+
+    watchdog = True
+    try:
+        signal.signal(signal.SIGALRM, _on_alarm)
+    except (ValueError, AttributeError):  # 非主线程 → 无看门狗可用
+        watchdog = False
+
     lg = bs.login()
     if lg.error_code != "0":
         logger.error(f"[worker] baostock 登录失败: {lg.error_msg}")
         return []
     results = []
-    max_retries = 3
+    done = 0
     try:
         for symbol, bs_code, start, end in tasks:
+            done += 1
+            if done > 1 and reconnect_every > 0 and done % reconnect_every == 1:
+                _quiet(bs.logout)
+                _drop_socket()
+                time.sleep(0.5)
+                _quiet(bs.login)
             rows: list[list[str]] = []
             ok = False
             for attempt in range(max_retries):
                 try:
+                    if watchdog:
+                        signal.alarm(query_timeout)
                     rs = bs.query_history_k_data_plus(
                         bs_code,
                         "date,open,high,low,close,volume,amount",
@@ -89,9 +149,13 @@ def _bs_fetch_batch(tasks: list) -> list:
                         raise RuntimeError(rs.error_msg)
                     while rs.next():
                         rows.append(rs.get_row_data())
+                    if watchdog:
+                        signal.alarm(0)
                     ok = True
                     break
                 except Exception as exc:
+                    if watchdog:
+                        signal.alarm(0)
                     if attempt < max_retries - 1:
                         wait = 2 ** (attempt + 1)
                         logger.warning(
@@ -99,24 +163,21 @@ def _bs_fetch_batch(tasks: list) -> list:
                             f"{wait}s 后重连重试"
                         )
                         time.sleep(wait)
-                        try:
-                            bs.logout()
-                        except Exception:
-                            pass
+                        _quiet(bs.logout)
+                        _drop_socket()
                         time.sleep(0.5)
-                        try:
-                            bs.login()
-                        except Exception as exc2:
-                            logger.warning(f"[worker] 重连失败: {exc2}")
+                        _quiet(bs.login)
                     else:
                         logger.warning(f"[{symbol}] sync {max_retries} 次重试均失败，跳过")
             if ok:
                 results.extend([symbol] + r for r in rows)
     finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+        _quiet(bs.logout) if watchdog else None
+        if not watchdog:
+            try:
+                bs.logout()
+            except Exception:
+                pass
     return results
 
 
