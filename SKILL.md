@@ -15,7 +15,7 @@ A 股日频量化选股 + 日报推送系统，经两轮深度增强后已成**�
 市场风格(regime.py)                               —— 沪深300 → up/down×low/high 四态
 策略状态机(strategy_map.py)                       —— regime→主攻/回避映射 + 信号过滤
 风险预算(portfolio --risk-budget)                 —— 状态→总仓位上限
-日报(report.py + cron 0fccfa4dd1f7 交易日20:00)   —— TOP10+共振+回测+🌡️市场状态区块
+日报(report.py + cron 0fccfa4dd1f7 交易日北京05:00)   —— TOP10+共振+回测+🌡️市场状态区块
 ```
 
 **核心研究结论（1y/2y 实证，net 25bp 成本，含退市股防幸存者偏差）**：
@@ -317,7 +317,8 @@ grep -c 离场 /opt/data/cron/output/<job_id>/<最新>.md
 
 ## 7. 运维
 
-- **cron `0fccfa4dd1f7`**：交易日北京 20:00（`0 12 * * 1-5` UTC，勿改盘前——数据日≠今日会判数据未就绪）；deliver=origin（定时 tick 投递可靠，agent.log 有 `delivered ... via live adapter` 铁证）；script=`/opt/data/scripts/sequoia_report.sh`（日历/数据就绪 → sync容错 → 回测缓存刷新 → report → tracker → 摘要含离场）
+- **cron `0fccfa4dd1f7`**：**交易日北京 05:00**（`0 21 * * 0-4` UTC = UTC 周日~周四 21:00 = 北京周一~周五 05:00；2026-09-23 用户由 20:00 改定，周一那份覆盖上周五收盘）；deliver=origin（定时 tick 投递可靠，agent.log 有 `delivered ... via live adapter` 铁证）；script=`/opt/data/scripts/sequoia_report.sh`（日历/数据就绪 → sync容错 → 回测缓存刷新 → report → tracker → 摘要含离场）
+- **🆕 跳过同步守卫（2026-09-23，`eca3fa6`+`38360c7`）**：`DB_MAX_DATE >= RECENT_CLOSED` 时**跳过增量同步**。改 05:00 后早晨的应达日 = 上一交易日、库内已是该日，不设守卫则 `main.py` 仍会对 5000+ 只发一轮 `start=今天/end=今天` 的空查询，**白耗 10~45 分钟**并把整条链暴露在 baostock 挂死风险下。实测守卫生效后全链 **real 4m54s**。`SEQUOIA_SKIP_SYNC`/`SEQUOIA_FORCE` 仍可覆盖。⚠️ 比较必须用 `! [[ "$A" < "$B" ]]`——bash 单括号 `[ ]` 不支持 `>=`，会报 `binary operator expected` 且**条件恒假（守卫静默失效）**
 - **`cron.script_timeout_seconds = 10800`**（2026-09-20 由 7200 提高）：最坏路径含 80 分钟探针等待 + 60 分钟同步 ≈ 160 分钟。⚠️ 实时读取，改后无需重启 gateway
 - **wrapper 标志分支**：`NO_TRADING_DAY`（日历判定真休市）｜`DATA_NOT_READY`（交易日但 baostock 数据未发布 —— **不是非交易日**）｜`SEQUOIA_ERROR`。cron prompt 已按三者分别指示
 - ⚠️ **/opt/data/scripts/sequoia_report.sh 必须是真文件**（薄启动器 `exec bash .../scripts/sequoia_report.sh`，主逻辑在仓库内维护）——2026-09-04 首日正式 tick 曾因该路径是**指向仓库的符号链接**被 cron runner realpath 校验拦截（`Blocked: script path resolves outside the scripts directory`），wrapper 完全没跑；force 版同坑排查
