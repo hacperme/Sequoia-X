@@ -104,8 +104,14 @@ fi
 #    engine 是"全部拉完才一次性落库"，超时=0 行写入，故超时放宽到 3600s。
 #    超时不算致命错误，继续尝试生成报告 —— 数据日正确性由下方二次校验把关。
 SYNC_CODE=0
+DATA_NOW=$(DB_MAX_DATE)
 if [ "$SEQUOIA_SKIP_SYNC" = "1" ]; then
     echo "（注：SEQUOIA_SKIP_SYNC=1 跳过增量同步）" >&2
+elif [ "$SEQUOIA_FORCE" != "1" ] && [ -n "$RECENT_CLOSED" ] && [ -n "$DATA_NOW" ] && [ "$DATA_NOW" \>= "$RECENT_CLOSED" ]; then
+    # 2026-09-23：日报改「北京 05:00」后，早晨运行的应达日 = 上一交易日，而库内已经是该日；
+    # main.py 仍会为全部 5000+ 只发一轮 start=今天/end=今天 的空查询（实测白耗 10~45 分钟，
+    # 并把整条链暴露在 baostock 收包挂死风险下）→ 数据日已达应达即跳过，只有落后时才同步。
+    echo "（注：库内数据日 $DATA_NOW 已达应达 $RECENT_CLOSED → 跳过增量同步，报告用现有数据）" >&2
 else
     SYNC_OUT=$(cd "$PROJ" && timeout 3600 $VENV_PY main.py 2>&1)
     SYNC_CODE=$?
@@ -205,7 +211,7 @@ try:
     lines.append('')
     lines.append(f\"🚪 离场提示: 持仓 {len(rows)} 只（按个股合并）｜建议离场 {len(trig)} 只（到期 {n_time}｜吊灯 {n_ch}）\")
     _decl = tk._trail_off_declared()
-    # 注意：本块整体是 shell 双引号字符串 → 代码里出现裸 " 会被 shell 吃掉（曾致 SyntaxError）
+    # 注意：本块整体是 shell 双引号字符串 → 代码里不要出现裸双引号（会被 shell 吃掉，曾致 SyntaxError）
     _decl_txt = ''
     if _decl:
         _parts = []
