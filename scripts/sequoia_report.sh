@@ -107,7 +107,7 @@ SYNC_CODE=0
 DATA_NOW=$(DB_MAX_DATE)
 if [ "$SEQUOIA_SKIP_SYNC" = "1" ]; then
     echo "（注：SEQUOIA_SKIP_SYNC=1 跳过增量同步）" >&2
-elif [ "$SEQUOIA_FORCE" != "1" ] && [ -n "$RECENT_CLOSED" ] && [ -n "$DATA_NOW" ] && [ "$DATA_NOW" \>= "$RECENT_CLOSED" ]; then
+elif [ "$SEQUOIA_FORCE" != "1" ] && [ -n "$RECENT_CLOSED" ] && [ -n "$DATA_NOW" ] && ! [[ "$DATA_NOW" < "$RECENT_CLOSED" ]]; then
     # 2026-09-23：日报改「北京 05:00」后，早晨运行的应达日 = 上一交易日，而库内已经是该日；
     # main.py 仍会为全部 5000+ 只发一轮 start=今天/end=今天 的空查询（实测白耗 10~45 分钟，
     # 并把整条链暴露在 baostock 收包挂死风险下）→ 数据日已达应达即跳过，只有落后时才同步。
