@@ -345,8 +345,9 @@ def _raw_close_frame(symbols: list[str], start: str, end: str,
     """
     path = Path(cache_db)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=60)
     try:
+        conn.execute("PRAGMA busy_timeout=60000")   # 与并发回测/cron 抢锁时等待而非立即报错
         conn.execute("CREATE TABLE IF NOT EXISTS raw_close "
                      "(symbol TEXT, date TEXT, close REAL, PRIMARY KEY(symbol,date))")
         conn.execute("CREATE TABLE IF NOT EXISTS fetch_log "
@@ -401,6 +402,8 @@ def _raw_close_frame(symbols: list[str], start: str, end: str,
                     conn.execute("INSERT INTO fetch_log VALUES (?,?,?,datetime('now'))",
                                  (sym, start, end))
                     fetched += 1
+                    if fetched % 200 == 0:      # 分批提交：避免整个拉取期（~11 分钟）独占写锁
+                        conn.commit()
                 conn.commit()
                 logger.info(f"不复权价缓存更新完成: {fetched}/{len(need)} 只")
             try:
