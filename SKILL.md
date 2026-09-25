@@ -318,6 +318,14 @@ grep -c 离场 /opt/data/cron/output/<job_id>/<最新>.md
 ## 7. 运维
 
 - **cron `0fccfa4dd1f7`**：**交易日北京 05:00**（`0 21 * * 0-4` UTC = UTC 周日~周四 21:00 = 北京周一~周五 05:00；2026-09-23 用户由 20:00 改定，周一那份覆盖上周五收盘）；deliver=origin（定时 tick 投递可靠，agent.log 有 `delivered ... via live adapter` 铁证）；script=`/opt/data/scripts/sequoia_report.sh`（日历/数据就绪 → sync容错 → 回测缓存刷新 → report → tracker → 摘要含离场）
+- **🆕 日报股价下限过滤（2026-09-23 用户要求「过滤股价低于10的」，`report.py --min-price`）**：
+  - 实现在 `sequoia_x/report.py`：`MarketCapLookup` 在查流通市值那次 baostock 查询里**顺带缓存不复权收盘价**（`get_price()`）——**零额外请求**；`ReportBuilder(min_price=)` 把它同时应用到**各策略 TOP** 与**共振票**。
+  - ⚠️ **不能用库内 `stock_daily.close` 判股价**：库里是**后复权**价（adjustflag=1），与真实盘口价差异大（分红送股累积），会误杀/误放。
+  - 计数口径：`count_in_range` 仍是「**仅市值区间**」（wrapper 5b 段的备援重试防呆依赖它，改成含股价会让「候选全<10 元」误触发重试）；过滤后计数单列 **`count_price_ok`**，JSON 顶层回显 `min_price`。
+  - wrapper：`--min-price "${SEQUOIA_MIN_PRICE:-10}"`（**默认 10 元**）；`SEQUOIA_MIN_PRICE=0` 关闭。第 7 段摘要与 markdown 均显示「股价达标 N」与剔除数。
+  - **不影响**：离场提示/持仓跟踪（持仓再多也照常提示）、回测参考（仍全样本口径，未按 ≥10 重算）。
+  - **自动传导**：`tracker` 注册新批次读的是 `daily_report.json` 的 `cross_hits` → 过滤后的名单自动成为新批次候选（已注册的历史批次不变）。
+  - 实测（数据日 2026-09-24，EVB 无关）：海龟 市值区间 50→股价达标 42、均线 23→13、RPS 48→45、共振 9→8（剔除 600755 厦门国贸）；**独立源（东财 kline fqt=0）逐只复核 38/38 全部 ≥10 元**。
 - **🆕 跳过同步守卫（2026-09-23，`eca3fa6`+`38360c7`）**：`DB_MAX_DATE >= RECENT_CLOSED` 时**跳过增量同步**。改 05:00 后早晨的应达日 = 上一交易日、库内已是该日，不设守卫则 `main.py` 仍会对 5000+ 只发一轮 `start=今天/end=今天` 的空查询，**白耗 10~45 分钟**并把整条链暴露在 baostock 挂死风险下。实测守卫生效后全链 **real 4m54s**。`SEQUOIA_SKIP_SYNC`/`SEQUOIA_FORCE` 仍可覆盖。⚠️ 比较必须用 `! [[ "$A" < "$B" ]]`——bash 单括号 `[ ]` 不支持 `>=`，会报 `binary operator expected` 且**条件恒假（守卫静默失效）**
 - **`cron.script_timeout_seconds = 10800`**（2026-09-20 由 7200 提高）：最坏路径含 80 分钟探针等待 + 60 分钟同步 ≈ 160 分钟。⚠️ 实时读取，改后无需重启 gateway
 - **wrapper 标志分支**：`NO_TRADING_DAY`（日历判定真休市）｜`DATA_NOT_READY`（交易日但 baostock 数据未发布 —— **不是非交易日**）｜`SEQUOIA_ERROR`。cron prompt 已按三者分别指示

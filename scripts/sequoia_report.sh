@@ -9,6 +9,7 @@
 # 环境变量:
 #   SEQUOIA_FORCE=1       跳过日历与数据就绪检查（跨日强制用现有数据，一次性验证用）
 #   SEQUOIA_SKIP_SYNC=1   跳过增量同步（验证 tracker/report 链路或应急用）
+#   SEQUOIA_MIN_PRICE     股价下限（元，不复权收盘价；默认 10；=0 关闭过滤）→2026-09-23 用户要求过滤股价<10
 #   SEQUOIA_PROBE_WAIT    数据未发布时的轮询间隔秒（默认 600）
 #   SEQUOIA_PROBE_MAX     最大轮询轮数（默认 8 → 最多等 80 分钟）
 
@@ -143,7 +144,7 @@ BT_CODE=$?
 REPORT_JSON="$DATA_DIR/daily_report.json"
 gen_report() {
     (cd "$PROJ" && timeout 600 $VENV_PY -m sequoia_x.report \
-        --json-out "$REPORT_JSON" 2>&1) | grep -vE "INFO|login|logout" >/dev/null
+        --json-out "$REPORT_JSON" --min-price "${SEQUOIA_MIN_PRICE:-10}" 2>&1) | grep -vE "INFO|login|logout" >/dev/null
 }
 gen_report
 REPORT_CODE=$?
@@ -193,9 +194,12 @@ d = json.load(open('$REPORT_JSON', encoding='utf-8'))
 bt = d.get('backtest', {})
 lines = []
 lines.append(f\"数据日: {d['date']}\")
-lines.append(f\"共振票: {len(d['cross_hits'])} 只\")
+_px = d.get('min_price') or 0
+lines.append(f\"共振票: {len(d['cross_hits'])} 只\" + ((f\"（已过滤股价<{_px:g}元）\") if _px > 0 else ''))
 for s in d['strategies']:
-    lines.append(f\"  {s['name']}: 滤后 {s['count_total']} / 区间内 {s['count_in_range']} / TOP{min(10, len(s['top']))}\")
+    _keep = s.get('count_price_ok', s['count_in_range'])
+    _tail = (f\" / 股价达标 {_keep}\") if _px > 0 else ''
+    lines.append(f\"  {s['name']}: 滤后 {s['count_total']} / 区间内 {s['count_in_range']}{_tail} / TOP{min(10, len(s['top']))}\")
 if bt:
     lines.append(f\"回测参考: {bt['range']}（JSON 内含 5/10/20 日胜率）\")
 

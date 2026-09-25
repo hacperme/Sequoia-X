@@ -7,7 +7,7 @@
 
 特性：
 - 股票元数据缓存：名称 / 上市日期（baostock 一次性拉取）
-- 过滤：排除 ST/*ST/退市整理 + 上市不满 min_ipo_days 天的新股
+- 过滤：排除 ST/*ST/退市整理 + 上市不满 min_ipo_days 天的新股 + 股价下限（min_price，0=关）
 - 流通市值：baostock 换手率反推（不复权收盘价 × 流通股本），仅对候选集查询
 - 多策略共振标注（同一代码被多个策略命中）
 - 输出：JSON（结构稳定，供投递/归档）或 Markdown（日报正文）
@@ -85,6 +85,9 @@ class MarketCapLookup:
     def __init__(self, engine: DataEngine) -> None:
         self.engine = engine
         self._cache: dict[str, float] = {}
+        # 不复权收盘价（与市值同一次 baostock 查询顺带缓存，零额外请求）。
+        # ⚠️ 不能用库内 stock_daily.close 判「股价」——库里存的是后复权价。
+        self._prices: dict[str, float] = {}
 
     def latest_trade_date(self) -> str:
         with sqlite3.connect(self.engine.db_path) as conn:
@@ -112,6 +115,7 @@ class MarketCapLookup:
                     row = rs.get_row_data()
                     try:
                         close, volume, turn = float(row[0]), float(row[1]), float(row[2])
+                        self._prices[code] = close
                         if turn > 0:
                             self._cache[code] = volume / (turn / 100) * close / 1e8
                     except (ValueError, ZeroDivisionError):
@@ -121,6 +125,10 @@ class MarketCapLookup:
 
     def get(self, code: str) -> float:
         return self._cache.get(code, 0.0)
+
+    def get_price(self, code: str) -> float:
+        """不复权收盘价（元）。当日停牌/取不到 → 0.0（会被股价下限过滤掉）。"""
+        return self._prices.get(code, 0.0)
 
 
 class ReportBuilder:
@@ -133,11 +141,14 @@ class ReportBuilder:
         min_cap_yi: float = 50.0,
         max_cap_yi: float = 800.0,
         min_ipo_days: int = 60,
+        min_price: float = 0.0,
     ) -> None:
         self.engine = engine
         self.strategies = strategies or DEFAULT_STRATEGIES
         self.min_cap = min_cap_yi
         self.max_cap = max_cap_yi
+        # 股价下限（元，不复权收盘价）。0 = 关闭（研究/回测口径不受影响）。
+        self.min_price = min_price
         self.meta = StockMeta(min_ipo_days=min_ipo_days)
         self.caps = MarketCapLookup(engine)
 
@@ -181,21 +192,27 @@ class ReportBuilder:
                      if not self.meta.is_junk(c)]
             in_range = [c for c in codes if self.min_cap <= self.caps.get(c) <= self.max_cap]
             in_range.sort(key=lambda c: self.caps.get(c), reverse=True)
+            # 股价下限过滤（count_in_range 保持「仅市值区间」语义不动——wrapper 的
+            # 备援重试防呆依赖它；过滤后计数单列 count_price_ok）
+            price_ok = [c for c in in_range if self._price_ok(c)]
             strategies_out.append({
                 "name": label,
-                "count_total": len(codes),        # 滤 ST/新股后
-                "count_in_range": len(in_range),  # 市值区间内
-                "top": in_range[:10],
+                "count_total": len(codes),          # 滤 ST/新股后
+                "count_in_range": len(in_range),    # 市值区间内
+                "count_price_ok": len(price_ok),    # 市值区间内 + 股价达标
+                "top": price_ok[:10],
             })
 
         # 共振票（>=2 策略命中，市值区间内）
         cross = []
         for code, labels in raw.items():
-            if len(labels) >= 2 and self.min_cap <= self.caps.get(code) <= self.max_cap:
+            if (len(labels) >= 2 and self.min_cap <= self.caps.get(code) <= self.max_cap
+                    and self._price_ok(code)):
                 cross.append({
                     "code": code,
                     "name": self.meta.names.get(code, code),
                     "cap_yi": round(self.caps.get(code), 1),
+                    "close": round(self.caps.get_price(code), 2),
                     "strategies": sorted(labels),
                 })
         cross.sort(key=lambda x: -x["cap_yi"])
@@ -225,10 +242,17 @@ class ReportBuilder:
         return {
             "date": result_date,
             "generated_at": date.today().isoformat(),
+            "min_price": self.min_price,
             "strategies": strategies_out,
             "cross_hits": cross,
             "regime": regime_info,
         }
+
+    def _price_ok(self, code: str) -> bool:
+        """股价下限判定。min_price<=0 视为关闭（不改变既有行为）。"""
+        if self.min_price <= 0:
+            return True
+        return self.caps.get_price(code) >= self.min_price
 
     def to_markdown(self, result: dict) -> str:
         lines = [f"📈 Sequoia-X 选股日报 | 数据日 {result['date']}（收盘后）", ""]
@@ -248,14 +272,17 @@ class ReportBuilder:
             if not s["count_in_range"]:
                 lines.append(f"【{s['name']}】无（滤后 {s['count_total']} 只）")
                 continue
-            lines.append(f"【{s['name']}】区间内 {s['count_in_range']} 只（TOP{min(10, len(s['top']))}）")
+            kept = s.get("count_price_ok", s["count_in_range"])
+            extra = f"，剔除股价<{self.min_price:g}元 {s['count_in_range'] - kept} 只" if self.min_price > 0 else ""
+            lines.append(f"【{s['name']}】区间内 {kept} 只（市值区间 {s['count_in_range']}{extra}；TOP{min(10, len(s['top']))}）")
             for i, code in enumerate(s["top"], 1):
-                lines.append(f"  {i:2d}. {code} {self.meta.names.get(code, '?'):6s} 市值{self.caps.get(code):.0f}亿")
+                lines.append(f"  {i:2d}. {code} {self.meta.names.get(code, '?'):6s} 市值{self.caps.get(code):.0f}亿 股价{self.caps.get_price(code):.2f}元")
             lines.append("")
         if result["cross_hits"]:
             lines.append("⭐ 多策略共振：")
             for c in result["cross_hits"]:
-                lines.append(f"  {c['code']} {c['name']} 市值{c['cap_yi']:.0f}亿（{' + '.join(c['strategies'])}）")
+                px = f" 股价{c['close']:.2f}元" if c.get("close") is not None else ""
+                lines.append(f"  {c['code']} {c['name']} 市值{c['cap_yi']:.0f}亿{px}（{' + '.join(c['strategies'])}）")
             # 入场跳空提醒（2026-09-18 验证加入）。跳空只有次日开盘才知道，日报在
             # 收盘后生成、无法预过滤，故只作可执行提示：次日开盘若高开 ≥5%（相对
             # 前收）直接放弃。依据 1Y/2Y 事件研究，该组均为负期望（1Y −3.58%/n=56、
@@ -287,6 +314,7 @@ def run_report(
     markdown: bool = False,
     cap_range: tuple[float, float] = (50.0, 800.0),
     backtest_json: str | None = "data/backtest_1y.json",
+    min_price: float = 0.0,
 ) -> dict:
     """执行报告构建并按要求输出。返回结构化结果 dict。
 
@@ -295,7 +323,8 @@ def run_report(
     """
     settings = get_settings()
     engine = DataEngine(settings)
-    builder = ReportBuilder(engine, min_cap_yi=cap_range[0], max_cap_yi=cap_range[1])
+    builder = ReportBuilder(engine, min_cap_yi=cap_range[0], max_cap_yi=cap_range[1],
+                            min_price=min_price)
     result = builder.build()
 
     if backtest_json:
@@ -325,12 +354,15 @@ def main() -> None:
     parser.add_argument("--markdown", action="store_true", help="打印 Markdown 日报")
     parser.add_argument("--min-cap", type=float, default=50.0, help="市值下限（亿元）")
     parser.add_argument("--max-cap", type=float, default=800.0, help="市值上限（亿元）")
+    parser.add_argument("--min-price", type=float, default=0.0,
+                        help="股价下限（元，不复权收盘价；0=不过滤）")
     args = parser.parse_args()
 
     if not args.json_out and not args.markdown:
         parser.error("至少指定 --json-out 或 --markdown 之一")
 
-    run_report(args.json_out, args.markdown, (args.min_cap, args.max_cap))
+    run_report(args.json_out, args.markdown, (args.min_cap, args.max_cap),
+               min_price=args.min_price)
 
 
 if __name__ == "__main__":
