@@ -10,6 +10,7 @@
 #   SEQUOIA_FORCE=1       跳过日历与数据就绪检查（跨日强制用现有数据，一次性验证用）
 #   SEQUOIA_SKIP_SYNC=1   跳过增量同步（验证 tracker/report 链路或应急用）
 #   SEQUOIA_MIN_PRICE     股价下限（元，不复权收盘价；默认 10；=0 关闭过滤）→2026-09-23 用户要求过滤股价<10
+#                        同时作用于「选股名单」与「回测参考」两处（同口径）
 #   SEQUOIA_PROBE_WAIT    数据未发布时的轮询间隔秒（默认 600）
 #   SEQUOIA_PROBE_MAX     最大轮询轮数（默认 8 → 最多等 80 分钟）
 
@@ -134,8 +135,9 @@ if [ "$SEQUOIA_FORCE" != "1" ] && [ -n "$RECENT_CLOSED" ] && [[ "$DATA_DATE" < "
 fi
 
 # ─── 4. 更新回测参考缓存（滚动 1 年窗口随数据日推进；失败不阻塞日报，沿用旧缓存）
-(cd "$PROJ" && timeout 240 $VENV_PY -m sequoia_x.backtest \
-    --period 1y --json-out data/backtest_1y.json 2>&1) \
+# 超时 240→600（2026-09-23）：带 --min-price 后首轮要拉不复权价缓存（增量缓存，后续很快）
+(cd "$PROJ" && timeout 600 $VENV_PY -m sequoia_x.backtest \
+    --period 1y --json-out data/backtest_1y.json --min-price "${SEQUOIA_MIN_PRICE:-10}" 2>&1) \
     | grep -vE "INFO|login|logout" >/dev/null
 BT_CODE=$?
 [ $BT_CODE -ne 0 ] && echo "（注：回测缓存刷新失败 exit=$BT_CODE，沿用旧缓存）" >&2
@@ -201,7 +203,7 @@ for s in d['strategies']:
     _tail = (f\" / 股价达标 {_keep}\") if _px > 0 else ''
     lines.append(f\"  {s['name']}: 滤后 {s['count_total']} / 区间内 {s['count_in_range']}{_tail} / TOP{min(10, len(s['top']))}\")
 if bt:
-    lines.append(f\"回测参考: {bt['range']}（JSON 内含 5/10/20 日胜率）\")
+    lines.append(f\"回测参考: {bt['range']}\" + ((f\"（已过滤股价<{(bt.get('min_price') or 0):g}元）\") if (bt.get('min_price') or 0) > 0 else '') + \"（JSON 内含 5/10/20 日胜率）\")
 
 # 🚪 离场提示（日报必须单列小节，勿省略）
 try:

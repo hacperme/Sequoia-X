@@ -293,7 +293,10 @@ class ReportBuilder:
         if result.get("backtest"):
             bt = result["backtest"]
             lines.append("")
-            lines.append(f"📊 回测参考（{bt['range']}，次日买入→N日卖出，已含双边成本 {bt.get('cost_bps', 25)}bp）")
+            _bt_px = bt.get("min_price") or 0
+            _bt_note = f"，已过滤股价<{_bt_px:g}元" if _bt_px > 0 else ""
+            lines.append(f"📊 回测参考（{bt['range']}{_bt_note}，次日买入→N日卖出，"
+                         f"已含双边成本 {bt.get('cost_bps', 25)}bp）")
             for name, hs in bt["strategies"].items():
                 if not any(v.get("count") for v in hs.values()):
                     continue

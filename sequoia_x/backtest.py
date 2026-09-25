@@ -10,6 +10,8 @@ v2 相对 v1 的修复（2026-09-04，详见 .hermes/plans/2026-09-04-sequoia-re
 7. 简化组合层：按信号日等权 → 净值曲线 → 年化/最大回撤/相对沪深300 超额
 
 口径：信号日收盘判定 → 次日收盘买入 → 未来 N 交易日收盘卖出；
+股价过滤（--min-price）：按**信号日不复权收盘价**（真实盘口价）剔除低价票，
+与 `sequoia_x.report --min-price` 同口径；库内 close 是后复权价，不能直接判股价。
 胜率 = 净收益 > 0 占比；净收益 = 毛收益 - cost_bps/10000。
 
 用法：
@@ -21,6 +23,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import signal
 import sqlite3
 import sys
 from pathlib import Path
@@ -44,6 +48,7 @@ HORIZONS = (5, 10, 20)
 MAE_H = 10          # 止损统计窗口（交易日）
 STOP_LEVELS = (0.05, 0.08)
 DEFAULT_COST_BPS = 25  # 双边合计成本基点（佣金+印花税+滑点）
+RAW_CLOSE_DB = "data/raw_close.db"   # 不复权收盘价增量缓存（股价过滤用）
 
 
 def _load_panel(db_path: str) -> pd.DataFrame:
@@ -323,6 +328,124 @@ def _portfolio(panel: pd.DataFrame, events: pd.DataFrame, h: int,
     return out
 
 
+def _to_bs_market(code: str) -> str:
+    return ("sh." if code.startswith(("6", "9")) else "sz.") + code
+
+
+def _raw_close_frame(symbols: list[str], start: str, end: str,
+                     cache_db: str = RAW_CLOSE_DB) -> pd.DataFrame:
+    """不复权收盘价（元）→ DataFrame[symbol,date,close]。**股价过滤专用**。
+
+    库内 `stock_daily.close` 是**后复权**价（adjustflag=1），与真实盘口价差异随分红送股
+    累积放大 → 不能用它判「股价 < N 元」。这里按 symbol 逐只拉 adjustflag=3（不复权）日线，
+    落 sqlite 增量缓存（`fetch_log` 记录已覆盖窗口，覆盖过就跳过，不重复联网）。
+
+    单只查询独立看门狗（SIGALRM，`SEQUOIA_QUERY_TIMEOUT` 默认 25s）→ 到点放弃该只并记
+    未覆盖（下轮重试），避免 baostock 收包挂死拖死整个回测（engine.py 同款防护）。
+    """
+    path = Path(cache_db)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS raw_close "
+                     "(symbol TEXT, date TEXT, close REAL, PRIMARY KEY(symbol,date))")
+        conn.execute("CREATE TABLE IF NOT EXISTS fetch_log "
+                     "(symbol TEXT, start TEXT, end TEXT, fetched_at TEXT)")
+        # 增量判据：按**该股缓存内的日期范围**是否覆盖 [start,end]（窗口每天滑动，
+        # 不能用「抓取窗口」判据——那样每天都会全量重拉 5000+ 只 ≈ 11 分钟）。
+        # 新上市股（min>start）与长期停牌股（max<end）会小幅重拉，量级很小。
+        need = []
+        for sym in sorted(set(symbols)):
+            row = conn.execute("SELECT MIN(date), MAX(date) FROM raw_close WHERE symbol=?",
+                               (sym,)).fetchone()
+            if not row or not row[0] or row[0] > start or row[1] < end:
+                need.append(sym)
+        if need:
+            import baostock as bs
+
+            timeout = int(os.environ.get("SEQUOIA_QUERY_TIMEOUT", "25"))
+            watchdog = True
+            try:
+                signal.signal(signal.SIGALRM, lambda *_a: (_ for _ in ()).throw(TimeoutError("query timeout")))
+            except (ValueError, OSError):   # 非主线程 → 退化为无看门狗
+                watchdog = False
+            logger.info(f"不复权价缓存：需拉取 {len(need)} 只（{start}~{end}）")
+            lg = bs.login()
+            if lg.error_code != "0":
+                logger.warning("baostock 登录失败，股价过滤将降级（取不到价 → 该股剔除）")
+            else:
+                fetched = 0
+                for sym in need:
+                    rows: list = []
+                    try:
+                        if watchdog:
+                            signal.alarm(timeout)
+                        rs = bs.query_history_k_data_plus(
+                            _to_bs_market(sym), "date,close", start_date=start,
+                            end_date=end, frequency="d", adjustflag="3",
+                        )
+                        while rs.next():
+                            rows.append(rs.get_row_data())
+                    except TimeoutError:
+                        logger.warning(f"{sym} 不复权价查询超时（跳过，下轮重试）")
+                        continue
+                    finally:
+                        if watchdog:
+                            signal.alarm(0)
+                    if rows:
+                        conn.executemany(
+                            "INSERT OR REPLACE INTO raw_close VALUES (?,?,?)",
+                            [(sym, r[0], float(r[1])) for r in rows if len(r) > 1 and r[1]],
+                        )
+                    conn.execute("DELETE FROM fetch_log WHERE symbol=?", (sym,))
+                    conn.execute("INSERT INTO fetch_log VALUES (?,?,?,datetime('now'))",
+                                 (sym, start, end))
+                    fetched += 1
+                conn.commit()
+                logger.info(f"不复权价缓存更新完成: {fetched}/{len(need)} 只")
+            try:
+                bs.logout()
+            except Exception:  # noqa: BLE001
+                pass
+        df = pd.read_sql("SELECT symbol, date, close FROM raw_close", conn)
+    finally:
+        conn.close()
+    if df.empty:
+        return pd.DataFrame({"symbol": [], "date": [], "close": []})
+    df["date"] = pd.to_datetime(df["date"])
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return df
+
+
+def _filter_events_by_price(
+    events: dict[str, pd.DataFrame], px: pd.DataFrame, min_price: float,
+) -> tuple[dict[str, pd.DataFrame], dict[str, dict]]:
+    """按「信号日不复权收盘价 >= min_price」过滤各策略事件表。**纯函数，不联网。**
+
+    取不到价（当日停牌/缓存缺）→ 视为不达标并单列计数（与 report 的
+    `count_price_ok` 同口径：宁可少选不选错）。min_price<=0 时原样返回。
+    """
+    if min_price <= 0:
+        return events, {}
+    p = px.rename(columns={"close": "raw_close"})
+    out: dict[str, pd.DataFrame] = {}
+    stats: dict[str, dict] = {}
+    for name, ev in events.items():
+        if ev.empty:
+            out[name], stats[name] = ev, {"kept": 0, "dropped": 0, "no_price": 0}
+            continue
+        m = ev.merge(p, on=["symbol", "date"], how="left")
+        keep = m["raw_close"] >= min_price
+        stats[name] = {
+            "kept": int(keep.sum()),
+            "dropped": int((~keep).sum()),
+            "no_price": int(m["raw_close"].isna().sum()),
+        }
+        cols = [c for c in ("symbol", "date", "seq") if c in m.columns]
+        out[name] = m.loc[keep, cols].reset_index(drop=True)
+    return out, stats
+
+
 def _fetch_index(index_code: str = "sh.000300", days_back: int = 800) -> pd.DataFrame | None:
     """取沪深300 日线（后复权 close），供组合层超额对比。
 
@@ -393,6 +516,7 @@ def run_backtest(
     with_portfolio: bool = True,
     fetch_index: bool = True,
     portfolio_hold: int | None = None,
+    min_price: float = 0.0,
 ) -> dict:
     settings = get_settings()
     engine = DataEngine(settings)
@@ -405,6 +529,18 @@ def run_backtest(
     panel["seq"] = panel.groupby("symbol").cumcount()
 
     events = compute_events(panel, turtle_window=turtle_window, rps_threshold=rps_threshold)
+
+    # 股价下限过滤（信号日不复权收盘价；与 report --min-price 同口径）
+    price_filter: dict[str, dict] = {}
+    if min_price > 0 and events:
+        syms = sorted({str(s) for ev in events.values() for s in ev["symbol"].unique()})
+        px = _raw_close_frame(syms, panel["date"].min().date().isoformat(),
+                              panel["date"].max().date().isoformat())
+        events, price_filter = _filter_events_by_price(events, px, min_price)
+        _tot = sum(v.get("dropped", 0) for v in price_filter.values())
+        _np = sum(v.get("no_price", 0) for v in price_filter.values())
+        logger.info(f"股价过滤 ≥{min_price:g} 元：剔除事件 {_tot} 个（其中取不到价 {_np} 个）")
+
     index_df = _fetch_index() if (with_portfolio and fetch_index) else None
 
     result: dict[str, dict] = {}
@@ -427,6 +563,8 @@ def run_backtest(
             result[name][f"{h}_exec"] = st
         # MAE/止损统计（固定 10 日窗口）
         result[name]["mae"] = _mae_stats(panel, ev)
+        if price_filter:
+            result[name]["min_price_filter"] = price_filter.get(name, {})
         # 简化组合层（持有期按策略注册表定档；portfolio_hold 显式指定时统一覆盖）
         if with_portfolio:
             h = portfolio_hold if portfolio_hold is not None else hold_days_for(name)
@@ -439,11 +577,13 @@ def run_backtest(
             f"信号日收盘判定 → 次日收盘买入 → 未来N交易日收盘卖出；"
             f"胜率/收益为 net 口径（已扣双边成本 {cost_bps}bp）；"
             f"含 2024 后退市股（消除幸存者偏差）；分板涨跌停；后复权价"
+            + (f"；已按信号日不复权收盘价过滤股价 < {min_price:g} 元" if min_price > 0 else "")
         ),
         "range": f"{panel['date'].min().date()} ~ {panel['date'].max().date()}",
         "n_stocks": int(panel["symbol"].nunique()),
         "n_rows": int(len(panel)),
         "cost_bps": cost_bps,
+        "min_price": min_price,
         "strategies": result,
     }
     if json_out:
@@ -515,6 +655,8 @@ def main() -> None:
                         help="组合层持有期(交易日)；缺省=按策略注册表定档")
     parser.add_argument("--no-index", action="store_true", help="跳过沪深300 超额对比")
     parser.add_argument("--grid", action="store_true", help="参数网格模式")
+    parser.add_argument("--min-price", type=float, default=0.0,
+                        help="股价下限（元，信号日不复权收盘价；0=不过滤）")
     args = parser.parse_args()
 
     if args.grid:
@@ -525,7 +667,7 @@ def main() -> None:
         period=args.period, json_out=args.json_out, cost_bps=args.cost_bps,
         turtle_window=args.turtle_window, rps_threshold=args.rps_threshold,
         with_portfolio=not args.no_portfolio, fetch_index=not args.no_index,
-        portfolio_hold=args.portfolio_hold,
+        portfolio_hold=args.portfolio_hold, min_price=args.min_price,
     )
     print(f"回测区间 {res['range']} | {res['n_stocks']} 只(含退市) | {res['n_rows']} 行 | 成本 {args.cost_bps}bp\n")
     for name, horizons in res["strategies"].items():
